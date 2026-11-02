@@ -1,0 +1,14 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: builderos
+      POSTGRES_PASSWORD: builderos
+      POSTGRES_DB: builderos
+    ports: ["5432:5432"]
+    volumes: [pgdata:/var/lib/postgresql/data]
+  mailhog:
+    image: mailhog/mailhog
+    ports: ["1025:1025", "8025:8025"]
+volumes:
+  pgdata: {}

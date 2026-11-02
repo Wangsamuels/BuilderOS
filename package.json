@@ -1,0 +1,37 @@
+{
+  "name": "builderos",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.28.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "turbo run dev --parallel --filter=@builderos/api --filter=@builderos/workers --filter=@builderos/seller-mesh",
+    "build": "turbo run build",
+    "typecheck": "turbo run typecheck",
+    "test": "vitest run",
+    "db:generate": "pnpm --filter @builderos/db generate",
+    "db:migrate": "pnpm --filter @builderos/db migrate",
+    "setup": "tsx scripts/setup.ts",
+    "demo": "tsx scripts/demo.ts",
+    "attack": "vitest run --dir tests/attack",
+    "heroku-postbuild": "pnpm build",
+    "start:web": "node apps/api/dist/index.js",
+    "start:worker": "node apps/workers/dist/index.js",
+    "release": "node packages/db/dist/migrate.js"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.20.0",
+    "turbo": "^2.5.0",
+    "typescript": "5.9.3",
+    "vitest": "^3.2.0",
+    "esbuild": "^0.25.0",
+    "@noble/curves": "^1.9.0",
+    "@noble/hashes": "^1.8.0",
+    "bs58": "^6.0.0",
+    "near-api-js": "^5.1.1",
+    "web-push": "^3.6.7"
+  }
+}

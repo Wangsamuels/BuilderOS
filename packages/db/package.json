@@ -1,0 +1,24 @@
+{
+  "name": "@builderos/db",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "scripts": {
+    "typecheck": "tsc -p .",
+    "build": "node ../../scripts/build.mjs src/migrate.ts dist/migrate.js",
+    "generate": "drizzle-kit generate",
+    "migrate": "tsx src/migrate.ts"
+  },
+  "dependencies": {
+    "@builderos/shared": "workspace:*",
+    "drizzle-orm": "^0.44.0",
+    "pg": "^8.16.0",
+    "pg-boss": "^10.3.0"
+  },
+  "devDependencies": {
+    "@types/pg": "^8.15.0",
+    "drizzle-kit": "^0.31.0"
+  }
+}

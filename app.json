@@ -1,0 +1,32 @@
+{
+  "name": "builderos-backend",
+  "description": "BuilderOS App API (web dyno) + workers (worker dyno) for the NEAR hackathon",
+  "stack": "heroku-24",
+  "buildpacks": [{ "url": "heroku/nodejs" }],
+  "formation": {
+    "web": { "quantity": 1, "size": "basic" },
+    "worker": { "quantity": 1, "size": "basic" }
+  },
+  "addons": [{ "plan": "heroku-postgresql:essential-0" }],
+  "env": {
+    "NODE_ENV": { "value": "production" },
+    "NETWORK": { "value": "testnet" },
+    "WEB_ORIGIN": { "description": "Your Vercel URL(s), comma-separated, e.g. https://builderos.vercel.app" },
+    "WEB_ORIGIN_PATTERN": { "description": "Optional regex for Vercel preview URLs", "required": false },
+    "COOKIE_DOMAIN": { "description": "Only if app.<domain> and api.<domain> share a parent domain, e.g. .builderos.dev", "required": false },
+    "SESSION_SECRET": { "generator": "secret" },
+    "AUTH_RECIPIENT": { "value": "builderos" },
+    "FACTORY_CONTRACT": { "required": false },
+    "REGISTRY_CONTRACT": { "required": false },
+    "WORKER_ACCOUNT_ID": { "required": false },
+    "WORKER_PRIVATE_KEY": { "required": false },
+    "VERIFIER_ACCOUNT_ID": { "required": false },
+    "VERIFIER_PRIVATE_KEY": { "required": false },
+    "AGENT_KEYSTORE_JSON": { "required": false },
+    "AGENT_KEYSTORE_PASSPHRASE": { "required": false },
+    "NEAR_AI_API_KEY": { "required": false },
+    "VAPID_PUBLIC_KEY": { "required": false },
+    "VAPID_PRIVATE_KEY": { "required": false },
+    "DB_POOL_MAX": { "value": "5" }
+  }
+}

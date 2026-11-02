@@ -1,0 +1,19 @@
+node_modules
+dist
+.env
+.env.*
+!.env.example
+.turbo
+keystore/*.json
+
+# OS / editor / keys
+.DS_Store
+*.pem
+*.key
+id_*
+
+# OS / editor / keys
+.DS_Store
+*.pem
+*.key
+id_*

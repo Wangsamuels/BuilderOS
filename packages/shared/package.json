@@ -1,0 +1,10 @@
+{
+  "name": "@builderos/shared",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "scripts": { "typecheck": "tsc -p ." },
+  "dependencies": { "zod": "^4.1.0", "pino": "^9.7.0" }
+}

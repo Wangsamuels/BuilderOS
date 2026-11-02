@@ -1,0 +1,10 @@
+{
+  "name": "@builderos/fetch",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "scripts": { "typecheck": "tsc -p ." },
+  "dependencies": { "@builderos/shared": "workspace:*", "@builderos/near": "workspace:*", "@builderos/rails": "workspace:*", "@noble/hashes": "^1.8.0" }
+}

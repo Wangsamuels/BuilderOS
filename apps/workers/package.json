@@ -1,0 +1,23 @@
+{
+  "name": "@builderos/workers",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch --env-file-if-exists=../../.env src/index.ts",
+    "build": "node ../../scripts/build.mjs src/index.ts dist/index.js",
+    "start": "node dist/index.js",
+    "typecheck": "tsc -p ."
+  },
+  "dependencies": {
+    "@builderos/bridge": "workspace:*",
+    "@builderos/crypto": "workspace:*",
+    "@builderos/db": "workspace:*",
+    "@builderos/indexer": "workspace:*",
+    "@builderos/keys": "workspace:*",
+    "@builderos/notify": "workspace:*",
+    "@builderos/orchestrator": "workspace:*",
+    "@builderos/shared": "workspace:*",
+    "@builderos/verifier": "workspace:*"
+  }
+}

@@ -1,0 +1,32 @@
+{
+  "name": "@builderos/api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch --env-file-if-exists=../../.env src/index.ts",
+    "build": "node ../../scripts/build.mjs src/index.ts dist/index.js",
+    "start": "node dist/index.js",
+    "typecheck": "tsc -p ."
+  },
+  "dependencies": {
+    "@builderos/crypto": "workspace:*",
+    "@builderos/db": "workspace:*",
+    "@builderos/keys": "workspace:*",
+    "@builderos/near": "workspace:*",
+    "@builderos/orchestrator": "workspace:*",
+    "@builderos/router": "workspace:*",
+    "@builderos/shared": "workspace:*",
+    "@builderos/fetch": "workspace:*",
+    "@builderos/rails": "workspace:*",
+    "@fastify/cookie": "^11.0.2",
+    "@fastify/cors": "^11.0.1",
+    "@fastify/rate-limit": "^10.3.0",
+    "fastify": "^5.4.0",
+    "pg": "^8.16.0",
+    "zod": "^4.1.0"
+  },
+  "devDependencies": {
+    "@types/pg": "^8.15.0"
+  }
+}
