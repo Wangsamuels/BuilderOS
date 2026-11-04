@@ -47,8 +47,36 @@ export function verifyNep413(p: {
   }
 }
 
-/** The key must be a full-access key on the account (a function-call key can't log a person in). */
+/** NEAR-implicit account id = lowercase hex of the 32-byte ed25519 public key (Privy / email wallets). */
+export function publicKeyToImplicitAccountId(publicKey: string): string {
+  return Buffer.from(parsePublicKey(publicKey)).toString("hex");
+}
+
+export function isImplicitAccountId(accountId: string): boolean {
+  return /^[0-9a-f]{64}$/.test(accountId);
+}
+
+/** True when accountId is the implicit address controlled by this ed25519 key (even before first on-chain tx). */
+export function matchesImplicitAccount(accountId: string, publicKey: string): boolean {
+  if (!isImplicitAccountId(accountId)) return false;
+  try {
+    return publicKeyToImplicitAccountId(publicKey) === accountId;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Person login key check.
+ * - Named / funded accounts: key must be FullAccess on-chain (FC keys cannot log humans in).
+ * - Privy / unfunded implicit accounts: account may not exist on RPC yet; accept when accountId === hex(pubkey)
+ *   after NEP-413 already proved key ownership.
+ */
 export async function isFullAccessKey(accountId: string, publicKey: string) {
-  const keys = await accessKeys(accountId);
-  return keys.some((k) => k.public_key === publicKey && k.access_key.permission === "FullAccess");
+  try {
+    const keys = await accessKeys(accountId);
+    return keys.some((k) => k.public_key === publicKey && k.access_key.permission === "FullAccess");
+  } catch {
+    return matchesImplicitAccount(accountId, publicKey);
+  }
 }

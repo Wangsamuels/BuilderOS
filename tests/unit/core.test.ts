@@ -2,7 +2,13 @@ import { describe, expect, it } from "vitest";
 import { ed25519 } from "@noble/curves/ed25519";
 import { sha256 } from "@noble/hashes/sha256";
 import bs58 from "bs58";
-import { nep413Payload, verifyNep413 } from "../../packages/near/src/nep413.js";
+import {
+  nep413Payload,
+  verifyNep413,
+  publicKeyToImplicitAccountId,
+  matchesImplicitAccount,
+  isImplicitAccountId,
+} from "../../packages/near/src/nep413.js";
 import { parseEventLog } from "../../packages/near/src/events.js";
 import { buildReceipt, scopeOf } from "../../packages/indexer/src/receipts.js";
 import { estimate, classifyTag } from "../../packages/router/src/index.js";
@@ -22,6 +28,17 @@ describe("NEP-413 sign-in", () => {
     expect(verifyNep413({ publicKey: pk, signature: sig, message, nonce, recipient: "builderos" })).toBe(true);
     expect(verifyNep413({ publicKey: pk, signature: sig, message: message + "!", nonce, recipient: "builderos" })).toBe(false);
     expect(verifyNep413({ publicKey: pk, signature: sig, message, nonce, recipient: "evil" })).toBe(false);
+  });
+  it("maps ed25519 keys to Privy-style implicit account ids", () => {
+    const sk = ed25519.utils.randomPrivateKey();
+    const raw = ed25519.getPublicKey(sk);
+    const pk = `ed25519:${bs58.encode(raw)}`;
+    const id = publicKeyToImplicitAccountId(pk);
+    expect(isImplicitAccountId(id)).toBe(true);
+    expect(id).toBe(Buffer.from(raw).toString("hex"));
+    expect(matchesImplicitAccount(id, pk)).toBe(true);
+    expect(matchesImplicitAccount("alice.testnet", pk)).toBe(false);
+    expect(matchesImplicitAccount("0".repeat(64), pk)).toBe(false);
   });
 });
 
