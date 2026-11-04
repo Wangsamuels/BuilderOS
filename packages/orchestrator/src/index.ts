@@ -4,6 +4,7 @@ import { eq, getDb, sql, tasks } from "@builderos/db";
 export * from "./keystore.js";
 export * from "./planner.js";
 export * from "./runner.js";
+export * from "./hire.js";
 
 /**
  * Scheduler: an approved plan is a DAG in `tasks` (depends_on). Tasks whose deps are all done and that

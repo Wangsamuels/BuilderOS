@@ -1,0 +1,18 @@
+[package]
+name = "builderos-registry"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+near-sdk.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+schemars.workspace = true
+
+[package.metadata.near]
+# Used by cargo-near when present
+reproducible_build = false

@@ -10,6 +10,7 @@ import { complete, MODELS, type Tier } from "@builderos/router";
 import { seal, serialize, serverKey, sha256Hex } from "@builderos/crypto";
 import { agentFor } from "./keystore.js";
 import { ROLE_FOR_TAG } from "./planner.js";
+import { evaluateAndMaybeHire } from "./hire.js";
 
 const exec = promisify(execFile);
 const ALWAYS_REVIEW = new Set(["contract", "security"]);
@@ -59,6 +60,14 @@ export async function runTask(taskId: string, log: Logger) {
   const [t] = await db.select().from(tasks).where(eq(tasks.id, taskId));
   if (!t || ["done", "running"].includes(t.status)) return;
   if (!t.departmentId) throw new Error(`task ${taskId} has no department`);
+
+  // Hire only when niche knowledge is necessary and cheaper/more efficient than the swarm.
+  const hireAttempt = await evaluateAndMaybeHire(taskId, log);
+  if (hireAttempt?.status === "review" || hireAttempt?.status === "retry" || hireAttempt?.status === "paused" || hireAttempt?.status === "failed") {
+    return hireAttempt;
+  }
+  // swarm_fallback / skipped → continue with in-house agents
+
   const role = ROLE_FOR_TAG[t.tag] ?? "backend";
   const agent = await agentFor(t.departmentId, role);
   if (!agent) throw new Error(`no agent key for ${t.departmentId}/${role}`);

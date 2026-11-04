@@ -21,6 +21,58 @@ const SELLERS: Seller[] = [
   { id: "run402", service: "hosting", rail: "x402-evm", price: "0", payTo: "0x6666666666666666666666666666666666666666", quality_note: "Postgres + auth + static + functions" },
 ];
 
+/** Niche specialists — hired only when decideHire says necessary + cheaper/more efficient than swarm. */
+type Hireable = {
+  agent_id: string;
+  service: string;
+  description: string;
+  skills: string[];
+  rating: number;
+  rail: "x402-evm";
+  pay_to: string;
+  currency: string;
+  price: string;
+  quality_note: string;
+};
+const HIREABLE: Hireable[] = [
+  {
+    agent_id: "counsel.delaware-llc",
+    service: "expertise",
+    description: "Delaware LLC formation, articles of organization, registered agent filings",
+    skills: ["llc", "incorporation", "delaware", "registered agent", "ein"],
+    rating: 0.91,
+    rail: "x402-evm",
+    pay_to: "0x7777777777777777777777777777777777777777",
+    currency: "usdc",
+    price: "2500000",
+    quality_note: "Formation packets only; not general product advice",
+  },
+  {
+    agent_id: "counsel.hipaa",
+    service: "expertise",
+    description: "HIPAA BAA review and PHI handling checklist for health apps",
+    skills: ["hipaa", "baa", "phi", "healthcare compliance"],
+    rating: 0.88,
+    rail: "x402-evm",
+    pay_to: "0x8888888888888888888888888888888888888888",
+    currency: "usdc",
+    price: "4000000",
+    quality_note: "Narrow HIPAA specialty; expensive vs swarm for ordinary auth work",
+  },
+  {
+    agent_id: "ads.programmatic",
+    service: "expertise",
+    description: "Programmatic media buy and ad campaign setup with budget caps",
+    skills: ["ad buy", "media buy", "programmatic", "campaign"],
+    rating: 0.84,
+    rail: "x402-evm",
+    pay_to: "0x9999999999999999999999999999999999999999",
+    currency: "usdc",
+    price: "1500000",
+    quality_note: "Paid media only; not in-app growth copy",
+  },
+];
+
 app.get("/registry", async (req) => {
   const service = (req.query as any).service;
   return SELLERS.filter((s) => !service || s.service === service).map((s) => ({
@@ -31,6 +83,36 @@ app.get("/registry", async (req) => {
     probe_url: `${BASE}/sellers/${s.id}/price`,
     quality_note: s.quality_note,
   }));
+});
+
+app.get("/hireable", async (req) => {
+  const service = (req.query as any).service;
+  return HIREABLE.filter((a) => !service || a.service === service).map((a) => ({
+    ...a,
+    endpoint: `${BASE}/hireable/${a.agent_id}`,
+  }));
+});
+
+app.get("/hireable/:id/quote", async (req, reply) => {
+  const a = HIREABLE.find((x) => x.agent_id === (req.params as any).id);
+  if (!a) return reply.code(404).send({ error: "unknown hireable agent" });
+  return { amount: a.price, currency: a.currency, pay_to: a.pay_to, rail: a.rail, agent_id: a.agent_id };
+});
+
+app.post("/hireable/:id/hire", async (req, reply) => {
+  const a = HIREABLE.find((x) => x.agent_id === (req.params as any).id);
+  if (!a) return reply.code(404).send({ error: "unknown hireable agent" });
+  const body = (req.body ?? {}) as any;
+  const bounty = req.headers["x-bounty-id"];
+  if (!bounty) return reply.code(400).send({ error: "x-bounty-id required (pay-on-green)" });
+  return {
+    ok: true,
+    summary: `Niche deliverable from ${a.agent_id} for: ${String(body.title ?? "").slice(0, 160)}`,
+    agent_id: a.agent_id,
+    amount: body.amount ?? a.price,
+    currency: body.currency ?? a.currency,
+    artifacts: [{ path: `niche/${a.agent_id}.md`, content: `# ${a.agent_id}\n\n${a.description}\n\nTask: ${body.title ?? ""}\n` }],
+  };
 });
 
 function challenge(s: Seller, resource: string, amount = s.price) {
@@ -115,7 +197,7 @@ app.post("/email/send", async (req) => {
   return { ok: true, id: randomBytes(6).toString("hex") };
 });
 
-app.get("/health", async () => ({ ok: true, service: "seller-mesh", sellers: SELLERS.length }));
+app.get("/health", async () => ({ ok: true, service: "seller-mesh", sellers: SELLERS.length, hireable: HIREABLE.length }));
 
 app.listen({ port: PORT, host: "0.0.0.0" }).catch((e) => {
   app.log.error(e);

@@ -5,6 +5,14 @@ dist
 !.env.example
 .turbo
 keystore/*.json
+.pnpm-store/
+.cargo-home/
+contracts/target/
+# Keep real wasm artifacts; ignore cargo build dir only
+
+# Private working notes — never ship to GitHub
+Claude outputs/
+"Claude outputs/"
 
 # OS / editor / keys
 .DS_Store
@@ -12,8 +20,7 @@ keystore/*.json
 *.key
 id_*
 
-# OS / editor / keys
-.DS_Store
-*.pem
-*.key
-id_*
+Claude outputs/
+.pnpm-store/
+.cargo-home/
+contracts/target/

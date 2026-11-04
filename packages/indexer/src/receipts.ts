@@ -68,13 +68,41 @@ export function buildReceipt(event: EventName, d: Record<string, any>, signer: s
       return { kind: "deposit", actor: s(d.payer), amount: s(d.amount), token: s(d.token), payload: { payer: d.payer } };
     case "revenue":
       return { kind: "revenue", actor: s(d.payer), amount: s(d.amount), token: s(d.token), foreignTx: s(d.foreign_tx), payload: { payer: d.payer } };
+    case "bounty_created":
+    case "agent_hired":
+      return {
+        kind: "bounty",
+        actor: signer,
+        amount: s(d.amount),
+        token: s(d.currency ?? d.token) ?? "usdc",
+        rail: s(d.rail),
+        payload: {
+          stage: "reserved",
+          task: d.task_id,
+          bounty_id: d.bounty_id,
+          payee: d.payee,
+          agent_id: d.agent_id,
+          currency: d.currency ?? d.token,
+        },
+      };
     case "bounty_released":
     case "bounty_voided":
       return {
         kind: "bounty",
         actor: signer,
         amount: s(d.amount),
-        payload: { task: d.task_id, payee: d.payee, verdict: d.verdict ?? (event === "bounty_voided" ? "fail" : "pass"), log_hash: d.log_hash, voided: event === "bounty_voided" },
+        token: s(d.currency ?? d.token) ?? "usdc",
+        rail: s(d.rail),
+        payload: {
+          task: d.task_id,
+          bounty_id: d.bounty_id,
+          payee: d.payee,
+          agent_id: d.agent_id,
+          verdict: d.verdict ?? (event === "bounty_voided" ? "fail" : "pass"),
+          log_hash: d.log_hash,
+          currency: d.currency ?? d.token,
+          voided: event === "bounty_voided",
+        },
       };
     case "member_invited":
     case "grant_set":

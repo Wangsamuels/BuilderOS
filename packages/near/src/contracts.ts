@@ -37,6 +37,10 @@ export const tx = {
   setTaskTier: (departmentId: string, taskId: string, tier: string, pinnedModel: string | null) =>
     call(departmentId, "set_task_tier", { task_id: taskId, tier, pinned_model: pinnedModel }, 30, ONE_YOCTO),
 
+  /** Founder/admin: pin a hireable agent (or clear) for a niche task before the swarm runs. */
+  setTaskHire: (departmentId: string, taskId: string, agentId: string | null) =>
+    call(departmentId, "set_task_hire", { task_id: taskId, agent_id: agentId }, 30, ONE_YOCTO),
+
   approve: (companyId: string, requestIds: string[], cardId?: string) => call(companyId, "approve", { request_ids: requestIds, card_id: cardId ?? null }, 100, ONE_YOCTO),
   reject: (companyId: string, requestIds: string[], cardId?: string) => call(companyId, "reject", { request_ids: requestIds, card_id: cardId ?? null }, 50, ONE_YOCTO),
 
@@ -81,11 +85,46 @@ export const serviceCalls = {
   }),
   recordTopup: (departmentId: string, a: Record<string, unknown>) => ({ contractId: departmentId, methodName: "record_topup", args: a, gas: 30n * TGAS }),
   recordWithdrawal: (companyId: string, a: Record<string, unknown>) => ({ contractId: companyId, methodName: "record_withdrawal", args: a, gas: 30n * TGAS }),
-  submitVerdict: (departmentId: string, a: { taskId: string; verdict: "pass" | "fail"; logHash: string }) => ({
+  submitVerdict: (departmentId: string, a: { taskId: string; verdict: "pass" | "fail"; logHash: string; bountyId?: string | null }) => ({
     contractId: departmentId,
     methodName: "submit_verdict",
-    args: { task_id: a.taskId, verdict: a.verdict, log_hash: a.logHash },
+    args: { task_id: a.taskId, verdict: a.verdict, log_hash: a.logHash, bounty_id: a.bountyId ?? null },
     gas: 50n * TGAS,
+  }),
+  /**
+   * Reserve exact hire payment (pay-on-green). Amount/currency/rail/payee must match the
+   * hired agent's quoted service cost. Released only after the hiring agent verifies pass
+   * and the verifier key submits the verdict.
+   */
+  createBounty: (
+    departmentId: string,
+    a: {
+      bountyId: string;
+      taskId: string;
+      agentId: string;
+      payee: string;
+      amount: string;
+      currency: string;
+      rail: string;
+      hiringRole: string;
+      quoteHash: string;
+    },
+  ) => ({
+    contractId: departmentId,
+    methodName: "create_bounty",
+    args: {
+      bounty_id: a.bountyId,
+      task_id: a.taskId,
+      agent_id: a.agentId,
+      payee: a.payee,
+      amount: a.amount,
+      currency: a.currency,
+      token: a.currency,
+      rail: a.rail,
+      hiring_role: a.hiringRole,
+      quote_hash: a.quoteHash,
+    },
+    gas: 80n * TGAS,
   }),
 };
 
@@ -108,6 +147,34 @@ export const views = {
   getSeller: (sellerId: string) => view<any>(network().registry, "get_seller", { seller_id: sellerId }),
   listSellers: (service: string) => view<any[]>(network().registry, "list_sellers", { service }),
   getModelsHash: () => view<string>(network().registry, "get_models_hash"),
+  /** Hireable niche agents (registry service, typically "expertise"). */
+  getHireableAgent: (agentId: string) => view<HireableAgentView | null>(network().registry, "get_hireable_agent", { agent_id: agentId }),
+  listHireableAgents: (service = "expertise") => view<HireableAgentView[]>(network().registry, "list_hireable_agents", { service }),
+  getBounty: (departmentId: string, bountyId: string) =>
+    view<{
+      bounty_id: string;
+      task_id: string;
+      payee: string;
+      amount: string;
+      currency: string;
+      rail: string;
+      agent_id: string;
+      status: string;
+    } | null>(departmentId, "get_bounty", { bounty_id: bountyId }),
+};
+
+export type HireableAgentView = {
+  agent_id: string;
+  service: string;
+  description: string;
+  skills: string[];
+  rating: number;
+  rail: string;
+  pay_to: string;
+  endpoint: string;
+  currency: string;
+  price: string;
+  quality_note?: string | null;
 };
 
 /** Founder check, read from chain (never from cache). */

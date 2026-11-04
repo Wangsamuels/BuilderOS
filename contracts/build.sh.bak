@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Build order: department → company (embeds dept wasm) → factory (embeds company wasm) → registry
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+cd "$ROOT"
+
+echo "==> building department"
+cargo build -p builderos-department --target wasm32-unknown-unknown --release
+cp -f target/wasm32-unknown-unknown/release/builderos_department.wasm wasm/department.wasm
+wasm-opt -Oz -o wasm/department.wasm wasm/department.wasm 2>/dev/null || true
+echo "    department.wasm $(wc -c < wasm/department.wasm) bytes"
+
+echo "==> building company (includes department.wasm)"
+cargo build -p builderos-company --target wasm32-unknown-unknown --release
+cp -f target/wasm32-unknown-unknown/release/builderos_company.wasm wasm/company.wasm
+wasm-opt -Oz -o wasm/company.wasm wasm/company.wasm 2>/dev/null || true
+echo "    company.wasm $(wc -c < wasm/company.wasm) bytes"
+
+echo "==> building factory (includes company.wasm)"
+cargo build -p builderos-factory --target wasm32-unknown-unknown --release
+cp -f target/wasm32-unknown-unknown/release/builderos_factory.wasm wasm/factory.wasm
+wasm-opt -Oz -o wasm/factory.wasm wasm/factory.wasm 2>/dev/null || true
+echo "    factory.wasm $(wc -c < wasm/factory.wasm) bytes"
+
+echo "==> building registry"
+cargo build -p builderos-registry --target wasm32-unknown-unknown --release
+cp -f target/wasm32-unknown-unknown/release/builderos_registry.wasm wasm/registry.wasm
+wasm-opt -Oz -o wasm/registry.wasm wasm/registry.wasm 2>/dev/null || true
+echo "    registry.wasm $(wc -c < wasm/registry.wasm) bytes"
+
+echo "OK — artifacts in contracts/wasm/"
+ls -la wasm/*.wasm

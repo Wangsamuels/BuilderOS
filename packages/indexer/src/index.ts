@@ -234,12 +234,62 @@ async function applyToCaches(db: DB, event: EventName, d: Record<string, any>, c
         .values({ departmentId: d.department_id, rail: d.rail, target: d.target ?? null, enabled: d.enabled ?? true })
         .onConflictDoUpdate({ target: [railFloats.departmentId, railFloats.rail], set: { target: d.target ?? null, enabled: d.enabled ?? true, updatedAt: new Date() } });
       break;
+    case "bounty_created":
+    case "agent_hired":
+      await db
+        .insert(bountiesCache)
+        .values({
+          taskId: d.task_id,
+          bountyId: d.bounty_id ?? null,
+          payee: d.payee ?? null,
+          amount: d.amount ?? null,
+          currency: d.currency ?? d.token ?? null,
+          rail: d.rail ?? null,
+          agentId: d.agent_id ?? null,
+          status: "reserved",
+          ...chain,
+        })
+        .onConflictDoUpdate({
+          target: bountiesCache.taskId,
+          set: {
+            bountyId: d.bounty_id ?? null,
+            payee: d.payee ?? null,
+            amount: d.amount ?? null,
+            currency: d.currency ?? d.token ?? null,
+            rail: d.rail ?? null,
+            agentId: d.agent_id ?? null,
+            status: "reserved",
+            ...chain,
+          },
+        });
+      break;
     case "bounty_released":
     case "bounty_voided":
       await db
         .insert(bountiesCache)
-        .values({ taskId: d.task_id, payee: d.payee ?? null, amount: d.amount ?? null, status: event === "bounty_released" ? "released" : "voided", verdict: d.verdict, logHash: d.log_hash, ...chain })
-        .onConflictDoUpdate({ target: bountiesCache.taskId, set: { status: event === "bounty_released" ? "released" : "voided", verdict: d.verdict, logHash: d.log_hash } });
+        .values({
+          taskId: d.task_id,
+          bountyId: d.bounty_id ?? null,
+          payee: d.payee ?? null,
+          amount: d.amount ?? null,
+          currency: d.currency ?? d.token ?? null,
+          rail: d.rail ?? null,
+          agentId: d.agent_id ?? null,
+          status: event === "bounty_released" ? "released" : "voided",
+          verdict: d.verdict,
+          logHash: d.log_hash,
+          ...chain,
+        })
+        .onConflictDoUpdate({
+          target: bountiesCache.taskId,
+          set: {
+            status: event === "bounty_released" ? "released" : "voided",
+            verdict: d.verdict,
+            logHash: d.log_hash,
+            amount: d.amount ?? null,
+            currency: d.currency ?? d.token ?? null,
+          },
+        });
       break;
     case "purchase_yielded": {
       if (!c.companyId) break;

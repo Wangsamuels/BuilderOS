@@ -20,6 +20,8 @@ const SIZE_TOKENS: Record<string, { in: number; out: number; calls: number }> = 
 };
 
 const TAG_RULES: Array<[RegExp, string]> = [
+  // Strong niche only — ordinary "compliance checklist in code" stays security/backend.
+  [/\b(llc formation|incorporation|articles of organization|sales tax nexus|hipaa ba+a|pci[\s-]?dss|soc\s?2 type|trademark filing|patent filing|ad\s?buy|programmatic media|media buy|kyc\/aml)\b/i, "niche"],
   [/\b(contract|near|rust|wasm|solidity)\b/i, "contract"],
   [/\b(auth|security|vuln|audit|xss|csrf|secret)\b/i, "security"],
   [/\b(deploy|ci|docker|infra|dns|domain|hosting)\b/i, "devops"],

@@ -9,6 +9,7 @@ import { estimate, classifyTag } from "../../packages/router/src/index.js";
 import { feeOk, needsTopup, topupAmount, MIN_TOPUP } from "../../packages/bridge/src/index.js";
 import { parseMppHeader, canonicalJson } from "../../packages/rails/src/index.js";
 import { heuristicPlan, topoOrder } from "../../packages/orchestrator/src/planner.js";
+import { decideHire, nicheNecessity, rankHireCandidates } from "../../packages/orchestrator/src/hire.js";
 import { seal, openString } from "../../packages/crypto/src/index.js";
 
 describe("NEP-413 sign-in", () => {
@@ -53,6 +54,80 @@ describe("router", () => {
   it("classifies tags", () => {
     expect(classifyTag("Write the NEAR contract for escrow")).toBe("contract");
     expect(classifyTag("Landing page component")).toBe("frontend");
+    expect(classifyTag("File Delaware LLC formation paperwork")).toBe("niche");
+  });
+});
+
+describe("niche hire gate", () => {
+  const agent = {
+    agent_id: "counsel.delaware-llc",
+    service: "expertise",
+    description: "Delaware LLC formation, articles of organization, registered agent filings",
+    skills: ["llc", "incorporation", "delaware", "registered agent"],
+    rating: 0.91,
+    rail: "x402-evm",
+    pay_to: "0x77",
+    endpoint: "http://localhost/hireable/counsel.delaware-llc",
+    currency: "usdc",
+    price: "2500000",
+    quality_note: "Formation only",
+  };
+
+  it("does not treat ordinary build work as hire-necessary", () => {
+    expect(nicheNecessity("Add signup API and landing page", "backend")).toBe(0);
+    expect(nicheNecessity("Improve onboarding UX", "frontend")).toBe(0);
+  });
+
+  it("requires strong niche necessity before hiring", () => {
+    expect(nicheNecessity("File Delaware LLC formation and EIN", "niche")).toBeGreaterThanOrEqual(0.75);
+    expect(nicheNecessity("Ask an expert opinion", "expert")).toBeLessThan(0.75);
+  });
+
+  it("hires only when cheaper than swarm or clearly more efficient", () => {
+    const ranked = rankHireCandidates({ title: "Delaware LLC formation articles of organization", tag: "niche" }, [agent], new Map(), 10_000_000n);
+    const cheap = decideHire({
+      title: "Delaware LLC formation articles of organization",
+      tag: "niche",
+      remainingBudget: 10_000_000n,
+      swarmCap: 5_000_000n,
+      candidates: ranked,
+    });
+    expect(cheap.hire).toBe(true);
+    expect(cheap.reason).toMatch(/affordable|efficient|pinned/);
+
+    const swarmCheaper = decideHire({
+      title: "Delaware LLC formation articles of organization",
+      tag: "niche",
+      remainingBudget: 10_000_000n,
+      swarmCap: 1_000_000n, // swarm cheaper than 2.5 USDC hire
+      candidates: ranked,
+    });
+    // Still may hire if highly efficient; with rating 0.91 + strong alignment it can.
+    // Force a weak agent to prove swarm_preferred path:
+    const weak = rankHireCandidates(
+      { title: "Delaware LLC formation articles of organization", tag: "niche" },
+      [{ ...agent, rating: 0.5, price: "9000000" }],
+      new Map(),
+      10_000_000n,
+    );
+    const no = decideHire({
+      title: "Delaware LLC formation articles of organization",
+      tag: "niche",
+      remainingBudget: 10_000_000n,
+      swarmCap: 1_000_000n,
+      candidates: weak,
+    });
+    expect(no.hire).toBe(false);
+
+    const randomBuild = decideHire({
+      title: "Refactor the signup form validation",
+      tag: "frontend",
+      remainingBudget: 10_000_000n,
+      swarmCap: 5_000_000n,
+      candidates: ranked,
+    });
+    expect(randomBuild.hire).toBe(false);
+    expect(randomBuild.reason).toBe("swarm_default_not_necessary");
   });
 });
 

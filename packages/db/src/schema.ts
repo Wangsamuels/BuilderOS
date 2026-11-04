@@ -145,13 +145,48 @@ export const receipts = pgTable(
 
 export const bountiesCache = pgTable("bounties_cache", {
   taskId: text("task_id").primaryKey(),
+  bountyId: text("bounty_id"),
   payee: text("payee"),
   amount: amount("amount"),
+  currency: text("currency"),
+  rail: text("rail"),
+  agentId: text("agent_id"),
   status: text("status").notNull(),
   verdict: text("verdict"),
   logHash: text("log_hash"),
   ...chain(),
 });
+
+/** Niche hire jobs: reserved exact quote, verified by the hiring platform agent, paid on pass. */
+export const hires = pgTable(
+  "hires",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    bountyId: text("bounty_id").notNull().unique(),
+    taskId: text("task_id").notNull(),
+    companyId: text("company_id").notNull(),
+    departmentId: text("department_id").notNull(),
+    hiringRole: text("hiring_role").notNull(),
+    hiringAgent: text("hiring_agent"),
+    hiredAgentId: text("hired_agent_id").notNull(),
+    amount: amount("amount").notNull(),
+    currency: text("currency").notNull(),
+    rail: text("rail").notNull(),
+    payTo: text("pay_to").notNull(),
+    quoteHash: text("quote_hash").notNull(),
+    alignmentScore: real("alignment_score"),
+    ratingUsed: real("rating_used"),
+    status: text("status").default("quoted").notNull(), // quoted|reserved|working|verified_pass|verified_fail|paid|voided|failed
+    deliverable: jsonb("deliverable"),
+    hiringVerdict: text("hiring_verdict"),
+    hiringReasons: jsonb("hiring_reasons").$type<string[]>(),
+    logHash: text("log_hash"),
+    nearTx: text("near_tx"),
+    updatedAt: ts("updated_at").defaultNow().notNull(),
+    createdAt: created(),
+  },
+  (t) => [index("hires_task_idx").on(t.taskId), index("hires_dept_idx").on(t.departmentId, t.status)],
+);
 
 export const railFloats = pgTable(
   "rail_floats",
@@ -250,6 +285,9 @@ export const tasks = pgTable(
     status: text("status").default("pending").notNull(), // pending|assigned|ready|running|paused|review|done|failed
     pauseReason: text("pause_reason"),
     agent: text("agent"),
+    /** When set, the orchestrator hires a niche agent instead of (or before) in-house generation. */
+    hireAgentId: text("hire_agent_id"),
+    hireRequired: boolean("hire_required").default(false).notNull(),
     attempts: integer("attempts").default(0).notNull(),
     commitSha: text("commit_sha"),
     updatedAt: ts("updated_at").defaultNow().notNull(),

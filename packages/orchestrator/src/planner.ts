@@ -2,7 +2,7 @@ import { env } from "@builderos/shared";
 import { classifyTag, estimate, type Tier } from "@builderos/router";
 import type { PlanFeature } from "@builderos/db";
 
-/** 8 build roles plus the business roles. Tag -> role used to pick the agent. */
+/** 8 build roles plus the business roles. Tag -> role used to pick the (hiring) agent. */
 export const ROLE_FOR_TAG: Record<string, string> = {
   frontend: "frontend",
   backend: "backend",
@@ -15,6 +15,8 @@ export const ROLE_FOR_TAG: Record<string, string> = {
   research: "scout",
   growth: "growth",
   support: "support",
+  niche: "backend",
+  expert: "backend",
 };
 
 const SIZES = ["xs", "s", "m", "l", "xl"] as const;
@@ -30,7 +32,10 @@ export function heuristicPlan(description: string): PlanFeature[] {
     .map((l) => l.replace(/^[-*\d.)\s]+/, "").trim())
     .filter((l) => l.length > 6)
     .slice(0, 12);
-  const feats: PlanFeature[] = lines.map((l, i) => ({ key: `f${i + 1}`, title: l.slice(0, 120), tag: classifyTag(l), size: sizeOf(l), dependsOn: [] }));
+  const feats: PlanFeature[] = lines.map((l, i) => {
+    const tag = classifyTag(l);
+    return { key: `f${i + 1}`, title: l.slice(0, 120), tag, size: sizeOf(l), dependsOn: [] };
+  });
   // Contracts and backend come first; frontend depends on backend; tests depend on everything.
   const backend = feats.filter((f) => f.tag === "backend" || f.tag === "contract").map((f) => f.key);
   for (const f of feats) {
@@ -57,7 +62,7 @@ export async function plan(description: string, tier: Tier) {
             {
               role: "system",
               content:
-                'You plan software builds. Reply with JSON {"features":[{"key":"f1","title":"...","tag":"frontend|backend|contract|security|devops|design|docs|test","size":"xs|s|m|l|xl","dependsOn":["f0"]}]}. Max 12 features.',
+                'You plan software builds. Prefer platform tags (frontend|backend|contract|security|devops|design|docs|test). Use tag niche|expert ONLY when the work needs regulated/licensed specialty knowledge the build swarm cannot do (legal formation, tax, HIPAA/PCI, trademark filing, media buy) — never for ordinary product improvements. Reply JSON {"features":[{"key":"f1","title":"...","tag":"...","size":"xs|s|m|l|xl","dependsOn":["f0"]}]}. Max 12 features.',
             },
             { role: "user", content: description },
           ],
@@ -67,13 +72,18 @@ export async function plan(description: string, tier: Tier) {
       const j = (await res.json()) as any;
       const parsed = JSON.parse(j.choices?.[0]?.message?.content ?? "{}");
       if (Array.isArray(parsed.features) && parsed.features.length) {
-        features = parsed.features.map((f: any, i: number) => ({
-          key: String(f.key ?? `f${i + 1}`),
-          title: String(f.title).slice(0, 200),
-          tag: ROLE_FOR_TAG[f.tag] ? f.tag : classifyTag(String(f.title)),
-          size: (SIZES as readonly string[]).includes(f.size) ? f.size : "m",
-          dependsOn: Array.isArray(f.dependsOn) ? f.dependsOn.map(String) : [],
-        }));
+        features = parsed.features.map((f: any, i: number) => {
+          const title = String(f.title).slice(0, 200);
+          const raw = String(f.tag ?? "");
+          const tag = raw in ROLE_FOR_TAG || raw === "niche" || raw === "expert" ? raw : classifyTag(title);
+          return {
+            key: String(f.key ?? `f${i + 1}`),
+            title,
+            tag,
+            size: (SIZES as readonly string[]).includes(f.size) ? f.size : "m",
+            dependsOn: Array.isArray(f.dependsOn) ? f.dependsOn.map(String) : [],
+          };
+        });
       }
     } catch {
       features = null;

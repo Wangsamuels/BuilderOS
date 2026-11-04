@@ -4,16 +4,17 @@ import {
   CreateCompanyBody,
   CreatePlanBody,
   EstimateQuery,
+  HireOptionsQuery,
   HttpError,
   PatchTaskBody,
   SellerOptionsQuery,
   env,
   type UnsignedTx,
 } from "@builderos/shared";
-import { companies, departments, desc, eq, getDb, inArray, plans, sellerOptions, tasks } from "@builderos/db";
+import { companies, departments, desc, eq, getDb, hires, inArray, plans, sellerOptions, tasks } from "@builderos/db";
 import { companyAccount, tx, views } from "@builderos/near";
 import { estimate, type Tier } from "@builderos/router";
-import { plan as runPlanner, topoOrder, ROLE_FOR_TAG } from "@builderos/orchestrator";
+import { listHireableAgents, nicheNecessity, HIRE_NECESSITY_MIN, plan as runPlanner, rankHireCandidates, ROLE_FOR_TAG, topoOrder } from "@builderos/orchestrator";
 import { parseChallenges, challengeAmount } from "@builderos/rails";
 import { seal, serialize, serverKey } from "@builderos/crypto";
 import { authorize, requireAccount, requireFounder, visibleCompanies } from "../auth.js";
@@ -121,6 +122,8 @@ export const coreRoutes: FastifyPluginAsync = async (app) => {
         estP50: e.p50,
         estP90: e.p90,
         cap: e.cap,
+        // Hint only — runtime still runs decideHire (necessity + cheaper/more-efficient). Never random.
+        hireRequired: nicheNecessity(f.title, f.tag) >= HIRE_NECESSITY_MIN,
         status: "pending",
       };
     });
@@ -160,6 +163,45 @@ export const coreRoutes: FastifyPluginAsync = async (app) => {
     const tier = body.tier ?? t.tier;
     const pinned = body.pinnedModel === undefined ? t.pinnedModel : body.pinnedModel;
     return { transaction: tx.setTaskTier(t.departmentId, t.id, tier, pinned) };
+  });
+
+  /** Ranked hireable niche agents for a brief, filtered to what the department budget can afford. */
+  app.get("/hires/options", async (req) => {
+    requireAccount(req);
+    const q = parse(HireOptionsQuery, req.query);
+    const agents = await listHireableAgents(q.service);
+    const brief = { title: q.q ?? "", tag: q.tag ?? "niche" };
+    const ranked = rankHireCandidates(brief, agents, new Map(), BigInt(Number.MAX_SAFE_INTEGER));
+    return {
+      options: ranked.slice(0, 5).map((c) => ({
+        agentId: c.agentId,
+        service: c.service,
+        description: c.description,
+        skills: c.skills,
+        rating: c.rating,
+        alignment: c.alignment,
+        score: c.score,
+        price: c.price,
+        currency: c.currency,
+        rail: c.rail,
+        payTo: c.payTo,
+        endpoint: c.endpoint,
+        qualityNote: c.qualityNote ?? null,
+      })),
+    };
+  });
+
+  app.get<{ Querystring: { companyId?: string; taskId?: string } }>("/hires", async (req) => {
+    const account = requireAccount(req);
+    const companyId = req.query.companyId;
+    if (!companyId) throw new HttpError(400, "companyId required");
+    await authorize(account, companyId, ["view"]);
+    const rows = await getDb()
+      .select()
+      .from(hires)
+      .where(req.query.taskId ? eq(hires.taskId, req.query.taskId) : eq(hires.companyId, companyId))
+      .orderBy(desc(hires.createdAt));
+    return { hires: rows };
   });
 
   /** Up to 3 sellers for one service with live 402 price and a quality note from the registry. */

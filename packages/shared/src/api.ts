@@ -4,7 +4,22 @@ import { z } from "zod";
 
 export const AccountId = z.string().regex(/^(([a-z\d]+[-_])*[a-z\d]+\.)*([a-z\d]+[-_])*[a-z\d]+$/).min(2).max(64);
 export const Tier = z.enum(["economy", "standard", "premium", "private"]);
-export const TaskTag = z.enum(["frontend", "backend", "contract", "security", "devops", "design", "docs", "test", "research", "growth", "support"]);
+export const TaskTag = z.enum([
+  "frontend",
+  "backend",
+  "contract",
+  "security",
+  "devops",
+  "design",
+  "docs",
+  "test",
+  "research",
+  "growth",
+  "support",
+  /** Outside the major platform roles — filled by a hired niche agent. */
+  "niche",
+  "expert",
+]);
 
 export const ChallengeQuery = z.object({ accountId: AccountId });
 export const VerifyBody = z.object({
@@ -45,6 +60,12 @@ export const EstimateQuery = z.object({
 export const PatchTaskBody = z.object({ tier: Tier.optional(), pinnedModel: z.string().nullable().optional() });
 
 export const SellerOptionsQuery = z.object({ service: z.string() });
+
+export const HireOptionsQuery = z.object({
+  service: z.string().default("expertise"),
+  q: z.string().optional(),
+  tag: z.string().optional(),
+});
 
 export const DecideApprovalBody = z.object({ decision: z.enum(["approve", "reject"]) });
 
