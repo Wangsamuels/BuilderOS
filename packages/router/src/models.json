@@ -1,20 +1,72 @@
 {
-  "version": 1,
-  "note": "Demo catalog. Prices are USDC smallest unit (6dp) per 1K tokens. Pin the sha256 of this file in the registry (get_models_hash).",
+  "version": 2,
+  "note": "NEAR AI models paid with x402 on Base USDC (via near-ai.x402 seller). No Tempo/MPP offers for inference. Pin sha256 of this file in the registry (get_models_hash).",
   "models": [
-    { "id": "qwen3-coder-30b", "lab": "alibaba", "tiers": ["economy"], "tags": ["frontend", "backend", "test", "docs"], "quality": 0.62, "latencyMs": 2500,
-      "offers": [ { "rail": "x402-evm", "sellerId": "inferx.base", "url": "/v1/chat/completions", "inPer1k": 150, "outPer1k": 600 },
-                  { "rail": "mpp-tempo-charge", "sellerId": "tempo-infer", "url": "/v1/chat/completions", "inPer1k": 140, "outPer1k": 560 } ] },
-    { "id": "deepseek-v3", "lab": "deepseek", "tiers": ["economy", "standard"], "tags": ["backend", "contract", "research", "docs", "growth", "support"], "quality": 0.72, "latencyMs": 4000,
-      "offers": [ { "rail": "x402-evm", "sellerId": "inferx.base", "url": "/v1/chat/completions", "inPer1k": 300, "outPer1k": 1100 } ] },
-    { "id": "gpt-5-mini", "lab": "openai", "tiers": ["standard"], "tags": ["frontend", "backend", "test", "design", "docs", "growth", "support"], "quality": 0.78, "latencyMs": 3500,
-      "offers": [ { "rail": "x402-evm", "sellerId": "inferx.base", "url": "/v1/chat/completions", "inPer1k": 250, "outPer1k": 2000 },
-                  { "rail": "mpp-tempo-charge", "sellerId": "tempo-infer", "url": "/v1/chat/completions", "inPer1k": 240, "outPer1k": 1900 } ] },
-    { "id": "claude-sonnet", "lab": "anthropic", "tiers": ["standard", "premium"], "tags": ["frontend", "backend", "contract", "security", "devops", "test", "design"], "quality": 0.88, "latencyMs": 6000,
-      "offers": [ { "rail": "x402-evm", "sellerId": "inferx.base", "url": "/v1/chat/completions", "inPer1k": 3000, "outPer1k": 15000 } ] },
-    { "id": "gemini-pro", "lab": "google", "tiers": ["premium"], "tags": ["frontend", "backend", "research", "security", "design"], "quality": 0.86, "latencyMs": 7000,
-      "offers": [ { "rail": "mpp-tempo-charge", "sellerId": "tempo-infer", "url": "/v1/chat/completions", "inPer1k": 1250, "outPer1k": 10000 } ] },
-    { "id": "deepseek-ai/DeepSeek-V3.1", "lab": "deepseek", "tiers": ["private"], "tags": ["frontend", "backend", "contract", "security", "devops", "test", "docs", "research"], "quality": 0.74, "latencyMs": 5000,
-      "offers": [ { "rail": "near-ai-cloud", "sellerId": "near-ai", "url": "/chat/completions", "inPer1k": 0, "outPer1k": 0 } ] }
+    {
+      "id": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+      "lab": "alibaba",
+      "tiers": ["economy"],
+      "tags": ["frontend", "backend", "test", "docs"],
+      "quality": 0.62,
+      "latencyMs": 2500,
+      "offers": [
+        { "rail": "x402-evm", "sellerId": "near-ai.x402", "url": "/v1/chat/completions", "inPer1k": 150, "outPer1k": 600 }
+      ]
+    },
+    {
+      "id": "deepseek-ai/DeepSeek-V3.1",
+      "lab": "deepseek",
+      "tiers": ["economy", "standard", "private"],
+      "tags": ["frontend", "backend", "contract", "security", "devops", "test", "docs", "research", "growth", "support"],
+      "quality": 0.74,
+      "latencyMs": 4500,
+      "offers": [
+        { "rail": "x402-evm", "sellerId": "near-ai.x402", "url": "/v1/chat/completions", "inPer1k": 300, "outPer1k": 1100 }
+      ]
+    },
+    {
+      "id": "openai/gpt-5-mini",
+      "lab": "openai",
+      "tiers": ["standard"],
+      "tags": ["frontend", "backend", "test", "design", "docs", "growth", "support"],
+      "quality": 0.78,
+      "latencyMs": 3500,
+      "offers": [
+        { "rail": "x402-evm", "sellerId": "near-ai.x402", "url": "/v1/chat/completions", "inPer1k": 250, "outPer1k": 2000 }
+      ]
+    },
+    {
+      "id": "anthropic/claude-sonnet-4",
+      "lab": "anthropic",
+      "tiers": ["standard", "premium"],
+      "tags": ["frontend", "backend", "contract", "security", "devops", "test", "design"],
+      "quality": 0.88,
+      "latencyMs": 6000,
+      "offers": [
+        { "rail": "x402-evm", "sellerId": "near-ai.x402", "url": "/v1/chat/completions", "inPer1k": 3000, "outPer1k": 15000 }
+      ]
+    },
+    {
+      "id": "google/gemini-2.5-pro",
+      "lab": "google",
+      "tiers": ["premium"],
+      "tags": ["frontend", "backend", "research", "security", "design"],
+      "quality": 0.86,
+      "latencyMs": 7000,
+      "offers": [
+        { "rail": "x402-evm", "sellerId": "near-ai.x402", "url": "/v1/chat/completions", "inPer1k": 1250, "outPer1k": 10000 }
+      ]
+    },
+    {
+      "id": "zai-org/GLM-4.7",
+      "lab": "zhipu",
+      "tiers": ["premium", "private"],
+      "tags": ["frontend", "backend", "contract", "security", "devops", "test", "docs", "research"],
+      "quality": 0.84,
+      "latencyMs": 5500,
+      "offers": [
+        { "rail": "x402-evm", "sellerId": "near-ai.x402", "url": "/v1/chat/completions", "inPer1k": 800, "outPer1k": 3200 }
+      ]
+    }
   ]
 }

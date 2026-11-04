@@ -40,11 +40,15 @@ const EnvSchema = z.object({
   AGENT_KEYSTORE_JSON: z.string().optional(), // encrypted keystore blob for Heroku (no disk)
   ORCHESTRATOR_X25519_SECRET: z.string().optional(),
 
-  // Inference
+  // Inference — models on Near AI paid via x402 (Base USDC). API key is optional fallback only.
   NEAR_AI_API_KEY: z.string().optional(),
   NEAR_AI_BASE_URL: z.string().default("https://cloud-api.near.ai/v1"),
+  /** x402 gateway that fronts Near AI models (Base USDC). Mesh overrides when USE_SELLER_MESH. */
+  NEAR_AI_X402_BASE_URL: z.string().default("https://x402.pingpay.io"),
+  /** If true and NEAR_AI_API_KEY is set, allow near-ai-cloud rail as last-resort fallback. Default off. */
+  NEAR_AI_API_KEY_FALLBACK: bool,
 
-  // Chains / bridges
+  // Chains / bridges — Tempo only when a non-model service needs MPP
   BASE_RPC_URL: z.string().optional(),
   TEMPO_RPC_URL: z.string().optional(),
   TEMPO_ENABLED: bool,

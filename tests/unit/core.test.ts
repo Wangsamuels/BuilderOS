@@ -137,13 +137,24 @@ describe("bridge rules", () => {
     expect(needsTopup(100n, 30n, 0n)).toBe(false);
     expect(needsTopup(100n, 30n, 40n)).toBe(true);
   });
-  it("tops up to 50% of target, min $10", () => {
+  it("tops up to 50% of target, min $10 (Tempo pocket only when TEMPO_ENABLED)", () => {
     expect(topupAmount(100_000_000n, 20_000_000n)).toBe(30_000_000n);
     expect(topupAmount(20_000_000n, 5_000_000n)).toBe(MIN_TOPUP);
   });
   it("fee guard is 1%", () => {
     expect(feeOk(1_000_000n, 10_000n)).toBe(true);
     expect(feeOk(1_000_000n, 10_001n)).toBe(false);
+  });
+});
+
+describe("model catalog rails", () => {
+  it("offers Near AI models over x402-evm only (no Tempo inference offers)", async () => {
+    const { MODELS } = await import("../../packages/router/src/index.js");
+    for (const m of MODELS) {
+      expect(m.offers.length).toBeGreaterThan(0);
+      expect(m.offers.every((o) => o.rail === "x402-evm")).toBe(true);
+      expect(m.offers.every((o) => o.sellerId === "near-ai.x402")).toBe(true);
+    }
   });
 });
 

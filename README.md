@@ -15,7 +15,7 @@ Letting autonomous agents spend money is only safe if a compromised server can't
 | Rule | What it means in practice |
 |---|---|
 | **The chain decides** | Postgres is a cache and a store for private data. Budgets, caps and permissions are always re-read from NEAR before acting. |
-| **No spending keys** | Agents hold *request-only* NEAR function-call keys. Workers can record results but never pay. The only exceptions are disclosed and capped: Tempo session wallets (≤ $5 each) and the NEAR AI Cloud API key. |
+| **No spending keys** | Agents hold *request-only* NEAR function-call keys. Workers can record results but never pay. Disclosed exceptions (capped): optional Tempo session wallets when an MPP service is required, and optional NEAR AI API-key fallback (off by default). |
 | **Everything leaves a receipt** | Every transaction, money or permission, produces an event and a receipt record. |
 | **Idempotent by default** | Every job and write carries an idempotency key, so retries never pay twice. |
 | **Private by default** | Code, prompts, plans and logs are stored encrypted (XChaCha20-Poly1305); only hashes go on chain. |
@@ -48,7 +48,7 @@ The API never signs anything. Every write endpoint returns **unsigned NEAR trans
     events)  ──► v1.signer (MPC) signs only what the contract approved
           │
           ▼
-   Sellers: x402 on Base · MPP on Tempo · NEAR AI Cloud
+   Sellers: Near AI models via x402 (Base USDC) · other x402 services · Tempo MPP only if needed
 ```
 
 | Service | Path | Runs as |
@@ -81,9 +81,9 @@ The SDK never supplies the payee or a hash to sign. Before paying, it refuses if
 | `mpp-tempo` session | Payment channel opened via Chain Signatures | Session wallet holds exactly the cap (≤ $5), swept on close |
 | `x402-near` | Delegated `ft_transfer` | Stretch goal |
 
-The **model router** scores models in the chosen tier (quality, own pass rate, cost, latency), compares the same model across rails, and pays the cheaper one. It falls back within the tier on errors and never moves up a tier without asking.
+The **model router** scores Near AI models in the chosen tier and pays them with **x402 on Base USDC** (department Chain Signatures Base address). Tempo/MPP is not used for inference.
 
-The **bridge worker** keeps each department's Tempo pocket funded. When the pocket drops below 25% of its target, it tops it up to 50% (minimum $10) via 1Click and Relay. It enforces a 1% fee guard and at most two top-ups per department per day. It also executes withdrawals without touching funds reserved for open sessions or pending purchases.
+The **bridge worker** only tops up a Tempo pocket when `TEMPO_ENABLED` and a non-model MPP service needs it (below 25% of target → top up toward 50%, min $10, 1% fee guard, ≤2/day). Model working capital stays as **USDC on Base**.
 
 ---
 

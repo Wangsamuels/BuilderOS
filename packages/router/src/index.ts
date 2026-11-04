@@ -80,9 +80,21 @@ export async function chooseModels(p: { tag: string; tier: Tier; size: string; p
 
   const scored = pool.map((m) => {
     const offers = [...m.offers]
-      .filter((o) => o.rail !== "mpp-tempo-charge" || network().tempo.enabled || env().USE_SELLER_MESH)
-      .sort((a, b) => Number(offerCost(a, t.in, t.out) - offerCost(b, t.in, t.out)));
-    const offer = offers[0] ?? m.offers[0];
+      // Models: x402 on Base USDC. Tempo/MPP only if explicitly enabled for a non-default offer.
+      .filter((o) => {
+        if (o.rail.startsWith("mpp-tempo")) return network().tempo.enabled || env().USE_SELLER_MESH;
+        if (o.rail === "near-ai-cloud") return Boolean(env().NEAR_AI_API_KEY_FALLBACK && env().NEAR_AI_API_KEY);
+        return true;
+      })
+      // Prefer x402-evm (Base USDC) over any other rail for the same model.
+      .sort((a, b) => {
+        const railRank = (r: string) => (r === "x402-evm" ? 0 : r === "x402-near" ? 1 : r === "near-ai-cloud" ? 9 : 5);
+        const rr = railRank(a.rail) - railRank(b.rail);
+        if (rr) return rr;
+        return Number(offerCost(a, t.in, t.out) - offerCost(b, t.in, t.out));
+      });
+    const offer = offers[0];
+    if (!offer) return null;
     const cost = offerCost(offer, t.in * t.calls, t.out * t.calls);
     const pr = passRate.get(m.id);
     const quality = pr == null ? m.quality : 0.5 * m.quality + 0.5 * pr;
@@ -90,14 +102,14 @@ export async function chooseModels(p: { tag: string; tier: Tier; size: string; p
     const latencyPenalty = m.latencyMs / 60_000;
     return { model: m, offer, expectedCost: cost, score: quality - costPenalty - latencyPenalty };
   });
-  return scored.sort((a, b) => b.score - a.score);
+  return scored.filter((c): c is Choice => c != null).sort((a, b) => b.score - a.score);
 }
 
 export type ChatMessage = { role: "system" | "user" | "assistant"; content: string };
 
 /**
- * Call a model through the chosen offer. Paid rails go through @builderos/fetch (a policy-checked purchase);
- * the private tier uses the NEAR AI Cloud key (disclosed, per-key spend cap).
+ * Call a model through the chosen offer. Default: Near AI via x402 on Base USDC
+ * (`@builderos/fetch` → request_purchase). Optional API-key fallback only if enabled.
  * Falls back within the tier on errors.
  */
 export async function complete(
@@ -114,7 +126,7 @@ export async function complete(
       const body = JSON.stringify({ model: c.model.id, messages: p.messages, max_tokens: p.maxTokens ?? 4000 });
       let res: Response;
       if (c.offer.rail === "near-ai-cloud") {
-        if (!env().NEAR_AI_API_KEY) throw new Error("NEAR_AI_API_KEY not set");
+        if (!env().NEAR_AI_API_KEY_FALLBACK || !env().NEAR_AI_API_KEY) throw new Error("near-ai-cloud fallback disabled");
         res = await fetch(`${env().NEAR_AI_BASE_URL}${c.offer.url}`, {
           method: "POST",
           headers: { "content-type": "application/json", authorization: `Bearer ${env().NEAR_AI_API_KEY}` },
@@ -122,7 +134,11 @@ export async function complete(
           signal: AbortSignal.timeout(120_000),
         });
       } else {
-        const base = env().USE_SELLER_MESH ? `${env().SELLER_MESH_URL}/sellers/${c.offer.sellerId}` : await sellerBaseUrl(c.offer.sellerId);
+        const base = env().USE_SELLER_MESH
+          ? `${env().SELLER_MESH_URL}/sellers/${c.offer.sellerId}`
+          : c.offer.sellerId === "near-ai.x402"
+            ? env().NEAR_AI_X402_BASE_URL.replace(/\/$/, "")
+            : await sellerBaseUrl(c.offer.sellerId);
         res = await deps.fetch(
           `${base}${c.offer.url}`,
           { method: "POST", headers: { "content-type": "application/json" }, body },

@@ -21,7 +21,7 @@ async function main() {
   console.log("standard tier, backend m:", estimate("backend", "m", "standard"));
 
   console.log("\n2) Agent calls a paid seller → 402");
-  const url = `${MESH}/sellers/inferx.base/v1/chat/completions`;
+  const url = `${MESH}/sellers/near-ai.x402/v1/chat/completions`;
   const body = JSON.stringify({ model: "gpt-5-mini", messages: [{ role: "user", content: "hello" }] });
   const r1 = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body });
   const [ch] = await parseChallenges(r1);

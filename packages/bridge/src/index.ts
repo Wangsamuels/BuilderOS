@@ -108,8 +108,15 @@ async function worker() {
   return serviceAccount(e.WORKER_ACCOUNT_ID, e.WORKER_PRIVATE_KEY);
 }
 
-/** Runs every minute: queue top-ups for pockets that need them. Returns department ids queued. */
+/**
+ * Runs every minute: queue Tempo pocket top-ups only when Tempo/MPP is enabled.
+ * Model spend uses Base USDC via x402 — do not bridge to Tempo for inference.
+ */
 export async function scanFloats(log: Logger, enqueue: (departmentId: string, amount: bigint) => Promise<void>) {
+  if (!network().tempo.enabled) {
+    log.debug("Tempo disabled — skipping float top-ups (models pay x402 on Base USDC)");
+    return [];
+  }
   const db = getDb();
   const today = new Date().toISOString().slice(0, 10);
   const rows = await db.select().from(railFloats).where(and(eq(railFloats.rail, "tempo"), eq(railFloats.enabled, true), eq(railFloats.paused, false)));
@@ -133,6 +140,10 @@ export async function scanFloats(log: Logger, enqueue: (departmentId: string, am
 
 /** One top-up job. Idempotent on jobId (stored on chain via request_rail_topup / record_topup). */
 export async function runTopup(p: { jobId: string; departmentId: string; amount: string }, log: Logger) {
+  if (!network().tempo.enabled) {
+    log.warn({ job: p.jobId }, "Tempo disabled — refusing top-up (models use Base USDC x402)");
+    return { status: "aborted" as const };
+  }
   const db = getDb();
   const [existing] = await db.select().from(bridgeTransfers).where(eq(bridgeTransfers.jobId, p.jobId));
   if (existing && ["done", "failed", "aborted"].includes(existing.status)) return existing;

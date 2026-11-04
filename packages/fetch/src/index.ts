@@ -53,7 +53,8 @@ type RequestResult =
   | { status: "pending"; request_id: string; reason: string }
   | { status: "rejected"; request_id: string; reason: string };
 
-export function pickChallenge(chs: Challenge[], prefer: Rail[] = ["x402-evm", "mpp-tempo-charge", "mpp-tempo-session", "x402-near"]) {
+/** Prefer Base USDC x402 (models / most services). Tempo MPP only when that is all that is offered. */
+export function pickChallenge(chs: Challenge[], prefer: Rail[] = ["x402-evm", "x402-near", "mpp-tempo-charge", "mpp-tempo-session"]) {
   const ranked = [...chs].sort((a, b) => {
     const pa = prefer.indexOf(a.rail);
     const pb = prefer.indexOf(b.rail);
