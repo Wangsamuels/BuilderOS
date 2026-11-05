@@ -5,6 +5,8 @@ import bs58 from "bs58";
 import {
   nep413Payload,
   verifyNep413,
+  verifyNep413Flexible,
+  parseSignature,
   publicKeyToImplicitAccountId,
   matchesImplicitAccount,
   isImplicitAccountId,
@@ -39,6 +41,19 @@ describe("NEP-413 sign-in", () => {
     expect(matchesImplicitAccount(id, pk)).toBe(true);
     expect(matchesImplicitAccount("alice.testnet", pk)).toBe(false);
     expect(matchesImplicitAccount("0".repeat(64), pk)).toBe(false);
+  });
+  it("accepts hex signatures and flexible recipients (web host vs AUTH_RECIPIENT)", () => {
+    const sk = ed25519.utils.randomPrivateKey();
+    const pk = `ed25519:${bs58.encode(ed25519.getPublicKey(sk))}`;
+    const nonce = new Uint8Array(32).fill(3);
+    const message = "Sign in to BuilderOS\nAccount: abc\nRecipient: builder-os-mu.vercel.app\nExpires: x";
+    const hash = sha256(nep413Payload({ message, nonce, recipient: "builder-os-mu.vercel.app" }));
+    const raw = ed25519.sign(hash, sk);
+    const b64 = Buffer.from(raw).toString("base64");
+    const hex = Buffer.from(raw).toString("hex");
+    expect(parseSignature(hex)?.length).toBe(64);
+    expect(verifyNep413({ publicKey: pk, signature: b64, message, nonce, recipient: "builderos" })).toBe(false);
+    expect(verifyNep413Flexible({ publicKey: pk, signature: `0x${hex}`, message, nonce, recipients: ["builderos", "builder-os-mu.vercel.app"] })).toBe(true);
   });
 });
 

@@ -30,21 +30,61 @@ export function parsePublicKey(pk: string): Uint8Array {
   return bs58.decode(data);
 }
 
+/** Decode NEP-413 / Privy signatures: base64, hex (optional 0x), or ed25519:<base58>. */
+export function parseSignature(signature: string): Uint8Array | null {
+  const s = signature.trim();
+  if (!s) return null;
+  try {
+    if (s.startsWith("ed25519:")) {
+      const raw = bs58.decode(s.slice("ed25519:".length));
+      return raw.length === 64 ? raw : null;
+    }
+    if (/^(0x)?[0-9a-fA-F]{128}$/.test(s)) {
+      const hex = s.startsWith("0x") ? s.slice(2) : s;
+      return Buffer.from(hex, "hex");
+    }
+    const b64 = Buffer.from(s, "base64");
+    return b64.length === 64 ? b64 : null;
+  } catch {
+    return null;
+  }
+}
+
 export function verifyNep413(p: {
   publicKey: string;
-  signature: string; // base64
+  signature: string; // base64 (also accepts hex / ed25519:base58 from Privy adapters)
   message: string;
   nonce: Uint8Array;
   recipient: string;
   callbackUrl?: string;
 }): boolean {
+  const sig = parseSignature(p.signature);
+  if (!sig) return false;
   const hash = sha256(nep413Payload(p));
-  const sig = Buffer.from(p.signature, "base64");
   try {
     return ed25519.verify(sig, hash, parsePublicKey(p.publicKey));
   } catch {
     return false;
   }
+}
+
+/** Try recipients / callbackUrl variants Privy or the web app may have used when signing. */
+export function verifyNep413Flexible(p: {
+  publicKey: string;
+  signature: string;
+  message: string;
+  nonce: Uint8Array;
+  recipients: string[];
+  callbackUrl?: string;
+}): boolean {
+  const recipients = [...new Set(p.recipients.map((r) => r.trim()).filter(Boolean))];
+  const callbacks = p.callbackUrl ? [p.callbackUrl, undefined] : [undefined];
+  for (const recipient of recipients) {
+    for (const callbackUrl of callbacks) {
+      if (verifyNep413({ ...p, recipient, callbackUrl })) return true;
+    }
+  }
+  return false;
 }
 
 /** NEAR-implicit account id = lowercase hex of the 32-byte ed25519 public key (Privy / email wallets). */
