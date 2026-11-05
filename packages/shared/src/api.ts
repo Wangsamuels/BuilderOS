@@ -24,8 +24,12 @@ export const TaskTag = z.enum([
 export const ChallengeQuery = z.object({ accountId: AccountId });
 export const VerifyBody = z.object({
   accountId: AccountId,
-  publicKey: z.string().startsWith("ed25519:"),
-  signature: z.string(), // base64 (NEP-413 signMessage output)
+  /** ed25519:… — prefix added if the client omits it (some Privy adapters). */
+  publicKey: z
+    .string()
+    .min(8)
+    .transform((s) => (s.startsWith("ed25519:") ? s : `ed25519:${s}`)),
+  signature: z.string(), // base64 (also hex / ed25519:base58 accepted by verifier)
   nonce: z.string(), // base64 32 bytes, as issued by /challenge
   message: z.string(),
   callbackUrl: z.string().optional(),

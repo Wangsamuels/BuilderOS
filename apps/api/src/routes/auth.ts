@@ -2,7 +2,7 @@ import type { FastifyPluginAsync, FastifyRequest } from "fastify";
 import { randomBytes } from "node:crypto";
 import { ChallengeQuery, VerifyBody, env, HttpError } from "@builderos/shared";
 import { authChallenges, authSessions, eq, getDb } from "@builderos/db";
-import { isFullAccessKey, publicKeyToImplicitAccountId, verifyNep413Flexible } from "@builderos/near";
+import { resolveLoginAccountId, verifyNep413Flexible } from "@builderos/near";
 import { COOKIE, cookieOptions, issueSession, requireAccount, visibleCompanies } from "../auth.js";
 import { originAllowed, parse } from "../app.js";
 
@@ -21,13 +21,18 @@ function challengeRecipient(req: FastifyRequest): string {
   return env().AUTH_RECIPIENT;
 }
 
+function normalizePublicKey(pk: string): string {
+  const s = pk.trim();
+  if (s.startsWith("ed25519:")) return s;
+  return `ed25519:${s}`;
+}
+
 /**
- * Sign-in: the browser signs a challenge (nonce + expiry) with its NEAR key via NEP-413 `signMessage`;
- * we verify the signature and that the key is a full-access key on the account (RPC), then issue an
- * HTTP-only session cookie (24h, rotated). The token is also returned for the Authorization: Bearer fallback.
+ * Sign-in: NEP-413 challenge → verify → session cookie + Bearer token.
+ * Privy email/Google: identity is the signing key's implicit hex account (synthetic bos-*.testnet ids are remapped).
  */
 export const authRoutes: FastifyPluginAsync = async (app) => {
-  const ipLimit = { rateLimit: { max: 10, timeWindow: "1 minute", keyGenerator: (req: { ip: string }) => req.ip } };
+  const ipLimit = { rateLimit: { max: 20, timeWindow: "1 minute", keyGenerator: (req: { ip: string }) => req.ip } };
 
   app.get("/challenge", { config: ipLimit }, async (req) => {
     const { accountId } = parse(ChallengeQuery, req.query);
@@ -36,12 +41,12 @@ export const authRoutes: FastifyPluginAsync = async (app) => {
     const recipient = challengeRecipient(req);
     const message = `Sign in to BuilderOS\nAccount: ${accountId}\nRecipient: ${recipient}\nExpires: ${expiresAt.toISOString()}`;
     await getDb().insert(authChallenges).values({ nonce: nonce.toString("base64"), accountId, message, expiresAt });
-    // Pass these straight to wallet.signMessage({ message, recipient, nonce: Buffer.from(nonce, "base64") })
     return { message, recipient, nonce: nonce.toString("base64"), expiresAt };
   });
 
   app.post("/verify", { config: ipLimit }, async (req, reply) => {
-    const body = parse(VerifyBody, req.body);
+    const raw = parse(VerifyBody, { ...(req.body as object), publicKey: normalizePublicKey(String((req.body as any)?.publicKey ?? "")) });
+    const body = raw;
     const db = getDb();
     const [ch] = await db.select().from(authChallenges).where(eq(authChallenges.nonce, body.nonce));
     if (!ch || ch.usedAt || ch.expiresAt < new Date() || ch.accountId !== body.accountId || ch.message !== body.message)
@@ -58,7 +63,6 @@ export const authRoutes: FastifyPluginAsync = async (app) => {
       }
     })();
     const recipients = [fromMessage, fromOrigin, env().AUTH_RECIPIENT, "builderos"].filter((x): x is string => Boolean(x));
-    // Also accept full origin URL as recipient (some wallets use that).
     if (req.headers.origin && originAllowed(req.headers.origin)) recipients.push(req.headers.origin);
 
     const ok = verifyNep413Flexible({
@@ -74,20 +78,7 @@ export const authRoutes: FastifyPluginAsync = async (app) => {
       throw new HttpError(401, "bad signature — sign with challenge.recipient and the exact challenge.message", "bad_signature");
     }
 
-    // Identity = account controlled by the signing key.
-    // FE sometimes sends synthetic names (bos-*.testnet) that do not exist on chain; Privy keys are implicit hex ids.
-    let accountId = body.accountId;
-    if (!(await isFullAccessKey(accountId, body.publicKey))) {
-      let implicit: string;
-      try {
-        implicit = publicKeyToImplicitAccountId(body.publicKey);
-      } catch {
-        throw new HttpError(401, "key is not a full-access key on this account", "bad_key");
-      }
-      req.log.warn({ claimed: accountId, implicit }, "auth: remapping claimed accountId to Privy implicit id");
-      accountId = implicit;
-    }
-
+    const accountId = await resolveLoginAccountId(body.accountId, body.publicKey, req.log);
     await db.update(authChallenges).set({ usedAt: new Date() }).where(eq(authChallenges.nonce, body.nonce));
     const { token, expiresAt } = await issueSession(reply, accountId, body.publicKey);
     return { accountId, token, expiresAt };
@@ -100,8 +91,11 @@ export const authRoutes: FastifyPluginAsync = async (app) => {
     return { ok: true };
   });
 
-  app.get("/me", async (req) => {
+  const me = async (req: FastifyRequest) => {
     const account = requireAccount(req);
     return { accountId: account, companies: await visibleCompanies(account) };
-  });
+  };
+  app.get("/me", me);
+  /** Alias for FE contract draft that expected /v1/auth/session */
+  app.get("/session", me);
 };

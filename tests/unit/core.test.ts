@@ -63,6 +63,15 @@ describe("NEP-413 sign-in", () => {
     const id = Buffer.from(raw).toString("hex");
     await expect(isFullAccessKey(id, pk)).resolves.toBe(true);
   });
+  it("remaps synthetic bos-*.testnet claims to the signing key's implicit id without RPC", async () => {
+    const { resolveLoginAccountId, isSyntheticPrivyAccountId } = await import("../../packages/near/src/resolve-login.js");
+    const sk = ed25519.utils.randomPrivateKey();
+    const raw = ed25519.getPublicKey(sk);
+    const pk = `ed25519:${bs58.encode(raw)}`;
+    const implicit = Buffer.from(raw).toString("hex");
+    expect(isSyntheticPrivyAccountId("bos-mw3zja0m-lphh.testnet")).toBe(true);
+    await expect(resolveLoginAccountId("bos-mw3zja0m-lphh.testnet", pk)).resolves.toBe(implicit);
+  });
 });
 
 describe("events and receipts", () => {
