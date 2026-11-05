@@ -2,7 +2,7 @@ import type { FastifyPluginAsync, FastifyRequest } from "fastify";
 import { randomBytes } from "node:crypto";
 import { ChallengeQuery, VerifyBody, env, HttpError } from "@builderos/shared";
 import { authChallenges, authSessions, eq, getDb } from "@builderos/db";
-import { isFullAccessKey, verifyNep413Flexible } from "@builderos/near";
+import { isFullAccessKey, publicKeyToImplicitAccountId, verifyNep413Flexible } from "@builderos/near";
 import { COOKIE, cookieOptions, issueSession, requireAccount, visibleCompanies } from "../auth.js";
 import { originAllowed, parse } from "../app.js";
 
@@ -73,11 +73,24 @@ export const authRoutes: FastifyPluginAsync = async (app) => {
       req.log.warn({ accountId: body.accountId, recipients }, "auth verify bad_signature");
       throw new HttpError(401, "bad signature — sign with challenge.recipient and the exact challenge.message", "bad_signature");
     }
-    if (!(await isFullAccessKey(body.accountId, body.publicKey))) throw new HttpError(401, "key is not a full-access key on this account", "bad_key");
+
+    // Identity = account controlled by the signing key.
+    // FE sometimes sends synthetic names (bos-*.testnet) that do not exist on chain; Privy keys are implicit hex ids.
+    let accountId = body.accountId;
+    if (!(await isFullAccessKey(accountId, body.publicKey))) {
+      let implicit: string;
+      try {
+        implicit = publicKeyToImplicitAccountId(body.publicKey);
+      } catch {
+        throw new HttpError(401, "key is not a full-access key on this account", "bad_key");
+      }
+      req.log.warn({ claimed: accountId, implicit }, "auth: remapping claimed accountId to Privy implicit id");
+      accountId = implicit;
+    }
 
     await db.update(authChallenges).set({ usedAt: new Date() }).where(eq(authChallenges.nonce, body.nonce));
-    const { token, expiresAt } = await issueSession(reply, body.accountId, body.publicKey);
-    return { accountId: body.accountId, token, expiresAt };
+    const { token, expiresAt } = await issueSession(reply, accountId, body.publicKey);
+    return { accountId, token, expiresAt };
   });
 
   app.post("/logout", async (req, reply) => {
