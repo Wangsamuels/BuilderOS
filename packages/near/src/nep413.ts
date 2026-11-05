@@ -106,17 +106,23 @@ export function matchesImplicitAccount(accountId: string, publicKey: string): bo
   }
 }
 
+function isFullAccessPermission(permission: unknown) {
+  return permission === "FullAccess";
+}
+
 /**
- * Person login key check.
- * - Named / funded accounts: key must be FullAccess on-chain (FC keys cannot log humans in).
- * - Privy / unfunded implicit accounts: account may not exist on RPC yet; accept when accountId === hex(pubkey)
- *   after NEP-413 already proved key ownership.
+ * Person login key check (after NEP-413 already proved key ownership).
+ * - Privy implicit accounts: accountId === hex(pubkey) is enough (unfunded or funded).
+ *   Do not require an RPC FullAccess hit — Privy keys / RPC key lists often disagree on format.
+ * - Named accounts: key must be FullAccess on-chain (FC keys cannot log humans in).
  */
 export async function isFullAccessKey(accountId: string, publicKey: string) {
+  if (matchesImplicitAccount(accountId, publicKey)) return true;
   try {
     const keys = await accessKeys(accountId);
-    return keys.some((k) => k.public_key === publicKey && k.access_key.permission === "FullAccess");
+    const want = publicKey.trim();
+    return keys.some((k) => k.public_key === want && isFullAccessPermission(k.access_key.permission));
   } catch {
-    return matchesImplicitAccount(accountId, publicKey);
+    return false;
   }
 }

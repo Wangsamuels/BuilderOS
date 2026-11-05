@@ -55,6 +55,14 @@ describe("NEP-413 sign-in", () => {
     expect(verifyNep413({ publicKey: pk, signature: b64, message, nonce, recipient: "builderos" })).toBe(false);
     expect(verifyNep413Flexible({ publicKey: pk, signature: `0x${hex}`, message, nonce, recipients: ["builderos", "builder-os-mu.vercel.app"] })).toBe(true);
   });
+  it("treats Privy implicit accountId+matching pubkey as a full-access login key", async () => {
+    const { isFullAccessKey } = await import("../../packages/near/src/nep413.js");
+    const sk = ed25519.utils.randomPrivateKey();
+    const raw = ed25519.getPublicKey(sk);
+    const pk = `ed25519:${bs58.encode(raw)}`;
+    const id = Buffer.from(raw).toString("hex");
+    await expect(isFullAccessKey(id, pk)).resolves.toBe(true);
+  });
 });
 
 describe("events and receipts", () => {
