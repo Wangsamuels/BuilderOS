@@ -202,21 +202,42 @@ app.all("/sellers/:id/*", async (req, reply) => {
   return { ok: true, seller: s.id, service: s.service, path, receipt: tx };
 });
 
-// ---- Relay bridge-mock ----
+// ---- Relay bridge-mock (Base USDC → Tempo USDC.e) — mirrors api.relay.link quote/v2 + intents/status/v3 ----
 const relay = new Map<string, number>();
-app.post("/bridge/quote", async (req) => {
-  const b = req.body as any;
+function mockRelayQuote(b: any) {
   const requestId = `0x${randomBytes(32).toString("hex")}`;
   relay.set(requestId, 0);
   const fee = (BigInt(b.amount ?? "0") / 1000n).toString(); // 0.1%
-  return { requestId, depositAddress: `0x${randomBytes(20).toString("hex")}`, details: { currencyIn: { amount: b.amount }, currencyOut: { amount: (BigInt(b.amount ?? "0") - BigInt(fee)).toString() } }, fees: { relayer: { amount: fee } } };
-});
-app.get("/bridge/requests/v3", async (req) => {
-  const id = (req.query as any).id;
+  const depositAddress = `0x${randomBytes(20).toString("hex")}`;
+  const amountOut = (BigInt(b.amount ?? "0") - BigInt(fee)).toString();
+  return {
+    requestId,
+    depositAddress,
+    details: { currencyIn: { amount: b.amount }, currencyOut: { amount: amountOut } },
+    fees: { relayer: { amount: fee } },
+    steps: [
+      {
+        requestId,
+        kind: "transaction",
+        items: [{ data: { to: depositAddress, data: "0x", value: "0" } }],
+      },
+    ],
+  };
+}
+app.post("/bridge/quote", async (req) => mockRelayQuote(req.body));
+app.post("/bridge/quote/v2", async (req) => mockRelayQuote(req.body));
+function mockRelayStatus(id: string) {
   const n = (relay.get(id) ?? 0) + 1;
   relay.set(id, n);
-  return { requests: [{ id, status: n >= 2 ? "success" : "pending", data: { inTxs: [{ hash: mockTx() }], outTxs: n >= 2 ? [{ hash: mockTx() }] : [] } }] };
-});
+  const done = n >= 2;
+  return {
+    status: done ? "success" : "pending",
+    txHashes: done ? [mockTx(), mockTx()] : [mockTx()],
+    requests: [{ id, status: done ? "success" : "pending", data: { inTxs: [{ hash: mockTx() }], outTxs: done ? [{ hash: mockTx() }] : [] } }],
+  };
+}
+app.get("/bridge/requests/v3", async (req) => mockRelayStatus(String((req.query as any).id ?? "")));
+app.get("/bridge/intents/status/v3", async (req) => mockRelayStatus(String((req.query as any).requestId ?? (req.query as any).id ?? "")));
 
 // ---- 1Click mock ----
 app.post("/oneclick/v0/quote", async (req) => {

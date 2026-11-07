@@ -194,6 +194,13 @@ describe("bridge rules", () => {
     expect(feeOk(1_000_000n, 10_000n)).toBe(true);
     expect(feeOk(1_000_000n, 10_001n)).toBe(false);
   });
+  it("maps Relay intent statuses for Tempo USDC.e fills", async () => {
+    const { mapRelayStatus } = await import("../../packages/bridge/src/index.js");
+    expect(mapRelayStatus("success")).toBe("success");
+    expect(mapRelayStatus("delayed")).toBe("pending");
+    expect(mapRelayStatus("refund")).toBe("refund");
+    expect(mapRelayStatus("failure")).toBe("failure");
+  });
 });
 
 describe("model catalog rails", () => {

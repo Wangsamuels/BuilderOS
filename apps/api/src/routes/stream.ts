@@ -36,8 +36,11 @@ export const streamRoutes: FastifyPluginAsync = async (app) => {
     await app.hub.add(account, companies, reply, last);
   });
 
-  /** Small status panel: indexer lag, queue depth, failed jobs, bridge transfers in flight. */
+  /** Small status panel: indexer lag, queue depth, failed jobs, bridge transfers in flight, Tempo/MPP rails. */
   app.get("/status", async () => {
+    const { env, network, relayBaseUrl } = await import("@builderos/shared");
+    const e = env();
+    const n = network();
     const db = getDb();
     const q = async (s: ReturnType<typeof sql>) => (await db.execute<any>(s).catch(() => ({ rows: [{}] }))).rows[0];
     const [lag, queue, failed, bridges, dead] = await Promise.all([
@@ -47,7 +50,23 @@ export const streamRoutes: FastifyPluginAsync = async (app) => {
       q(sql`select count(*)::int as n from bridge_transfers where status in ('requested','bridging')`),
       q(sql`select count(*)::int as n from dead_letters where created_at > now() - interval '24 hours'`),
     ]);
-    return { indexerLag: lag, queueDepth: queue?.n ?? null, failedJobs24h: failed?.n ?? null, bridgesInFlight: bridges?.n ?? 0, deadLetters24h: dead?.n ?? 0, sseClients: app.hub.size };
+    return {
+      indexerLag: lag,
+      queueDepth: queue?.n ?? null,
+      failedJobs24h: failed?.n ?? null,
+      bridgesInFlight: bridges?.n ?? 0,
+      deadLetters24h: dead?.n ?? 0,
+      sseClients: app.hub.size,
+      tempo: {
+        enabled: n.tempo.enabled,
+        chainId: n.tempo.chainId,
+        usdc: n.tempo.usdc,
+        rpcUrl: n.tempo.rpcUrl,
+        relayBaseUrl: relayBaseUrl(),
+        relayApiKeySet: Boolean(e.RELAY_API_KEY),
+        sellerMesh: Boolean(e.USE_SELLER_MESH),
+      },
+    };
   });
 };
 

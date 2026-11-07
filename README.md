@@ -218,7 +218,7 @@ pnpm test                # unit + attack tests
 
 Built for the NEAR hackathon and running on **testnet**.
 
-- The Tempo rail is wired but switched off (`TEMPO_ENABLED`) pending the Tempo spike.
+- Tempo MPP (services outside x402): set `TEMPO_ENABLED=true`. Pocket top-ups use Relay `quote/v2` Base USDC → Tempo USDC.e (`RELAY_API_KEY` / `RELAY_BASE_URL`, or seller-mesh mock). Models stay on Base USDC x402.
 - The indexer uses RPC polling; NEAR Lake is the upgrade path if lag shows up.
 - Mainnet runs only after a founder-approved switch (`NETWORK=mainnet`).
 

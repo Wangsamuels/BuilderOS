@@ -1,20 +1,38 @@
 import { randomUUID } from "node:crypto";
-import { env, network, toBig, type Logger } from "@builderos/shared";
+import { env, network, relayBaseUrl, toBig, type Logger } from "@builderos/shared";
 import { and, bridgeTransfers, departments, eq, getDb, railFloats, sql, withdrawals } from "@builderos/db";
 import { callAs, serviceAccount, serviceCalls } from "@builderos/near";
 
 /**
  * Bridge worker: keeps each department's Tempo pocket topped up and executes withdrawals.
  * Holds a record-only worker key: request_rail_topup / record_* — it can't pay.
+ *
+ * Tempo MPP path (services outside x402): Intents USDC → Base (1Click) → Tempo USDC.e (Relay).
+ * Models stay on Base USDC x402 and do not use this bridge.
  */
 
 export const MIN_TOPUP = 10_000_000n; // $10 (USDC 6dp)
 export const MAX_FEE_BPS = 100n; // 1%
 export const MAX_TOPUPS_PER_DAY = 2;
 
-export type Quote = { quoteId: string; amountIn: string; amountOut: string; depositAddress: string; fees: string };
+export type Quote = { quoteId: string; amountIn: string; amountOut: string; depositAddress: string; fees: string; steps?: unknown };
 
-/** 1Click (NEAR Intents) + Relay clients. On testnet: 1Click dry-run, Relay through bridge-mock. */
+function relayHeaders(): Record<string, string> {
+  const key = env().RELAY_API_KEY;
+  return { "content-type": "application/json", ...(key ? { "x-api-key": key } : {}) };
+}
+
+/** Map Relay intent status → our bridge row status. */
+export function mapRelayStatus(raw: string | undefined): "pending" | "success" | "failure" | "refund" {
+  const s = (raw ?? "pending").toLowerCase();
+  if (s === "success") return "success";
+  if (s === "failure" || s === "failed") return "failure";
+  if (s === "refund" || s === "refunded") return "refund";
+  // waiting | depositing | pending | submitted | delayed → keep polling
+  return "pending";
+}
+
+/** 1Click (NEAR Intents) + Relay clients. Mesh mock when USE_SELLER_MESH / BRIDGE_MOCK; live Relay when TEMPO_ENABLED. */
 export const bridgeClients = {
   async oneClickQuote(p: { amount: string; recipient: string; refundTo: string; originAsset: string; destinationAsset: string }): Promise<Quote> {
     const e = env();
@@ -50,42 +68,60 @@ export const bridgeClients = {
     };
   },
 
+  /**
+   * Relay quote/v2: Base USDC → Tempo USDC.e (chain 4217).
+   * @see https://tempo.xyz/developers/docs/guide/bridge-relay
+   */
   async relayQuote(p: { amount: string; user: string; recipient: string }): Promise<Quote> {
-    const base = env().RELAY_BASE_URL ?? env().BRIDGE_MOCK_URL;
-    const res = await fetch(`${base}/quote`, {
+    const n = network();
+    const base = relayBaseUrl();
+    const mock = base.includes("4100") || base.includes("/bridge");
+    const body = {
+      user: p.user,
+      recipient: p.recipient,
+      originChainId: mock ? n.base.chainId : n.tempo.relayOriginChainId,
+      destinationChainId: n.tempo.chainId,
+      originCurrency: mock ? n.base.usdc : n.tempo.relayOriginUsdc,
+      destinationCurrency: n.tempo.usdc,
+      amount: p.amount,
+      tradeType: "EXACT_INPUT" as const,
+      useExternalLiquidity: true,
+    };
+    const res = await fetch(`${base}/quote/v2`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        user: p.user,
-        recipient: p.recipient,
-        originChainId: network().base.chainId,
-        destinationChainId: "tempo",
-        originCurrency: network().base.usdc,
-        destinationCurrency: "usdc",
-        amount: p.amount,
-        tradeType: "EXACT_INPUT",
-        useDepositAddress: true,
-      }),
+      headers: relayHeaders(),
+      body: JSON.stringify(body),
       signal: AbortSignal.timeout(20_000),
     });
-    if (!res.ok) throw new Error(`relay quote ${res.status}`);
+    if (!res.ok) throw new Error(`relay quote/v2 ${res.status}: ${(await res.text()).slice(0, 400)}`);
     const j = (await res.json()) as any;
-    return {
-      quoteId: j.requestId ?? j.steps?.[0]?.requestId ?? randomUUID(),
-      amountIn: String(j.details?.currencyIn?.amount ?? p.amount),
-      amountOut: String(j.details?.currencyOut?.amount ?? p.amount),
-      depositAddress: j.depositAddress ?? j.steps?.[0]?.depositAddress ?? "",
-      fees: String(j.fees?.relayer?.amount ?? "0"),
-    };
+    const step0 = j.steps?.[0];
+    const item0 = step0?.items?.[0];
+    const requestId = step0?.requestId ?? j.requestId ?? randomUUID();
+    const amountIn = String(j.details?.currencyIn?.amount ?? p.amount);
+    const amountOut = String(j.details?.currencyOut?.amount ?? p.amount);
+    const fees = String(j.fees?.relayer?.amount ?? j.fees?.gas?.amount ?? "0");
+    // Deposit address when present; otherwise the first tx `to` (Relay depository).
+    const depositAddress = String(j.depositAddress ?? item0?.data?.to ?? step0?.depositAddress ?? "");
+    return { quoteId: requestId, amountIn, amountOut, depositAddress, fees, steps: j.steps };
   },
 
   async relayStatus(requestId: string): Promise<{ status: "pending" | "success" | "failure" | "refund"; destTx?: string; originTx?: string }> {
-    const base = env().RELAY_BASE_URL ?? env().BRIDGE_MOCK_URL;
-    const res = await fetch(`${base}/requests/v3?id=${encodeURIComponent(requestId)}`, { signal: AbortSignal.timeout(15_000) });
+    const base = relayBaseUrl();
+    const url = `${base}/intents/status/v3?requestId=${encodeURIComponent(requestId)}`;
+    let res = await fetch(url, { headers: relayHeaders(), signal: AbortSignal.timeout(15_000) });
+    // Legacy mock path
+    if (res.status === 404) {
+      res = await fetch(`${base}/requests/v3?id=${encodeURIComponent(requestId)}`, { signal: AbortSignal.timeout(15_000) });
+    }
     if (!res.ok) return { status: "pending" };
     const j = (await res.json()) as any;
     const r = j.requests?.[0] ?? j;
-    return { status: r.status ?? "pending", destTx: r.data?.outTxs?.[0]?.hash ?? r.destTx, originTx: r.data?.inTxs?.[0]?.hash ?? r.originTx };
+    const status = mapRelayStatus(r.status);
+    const txHashes: string[] = r.txHashes ?? r.data?.txHashes ?? [];
+    const inTx = r.data?.inTxs?.[0]?.hash ?? r.originTx ?? txHashes[0];
+    const outTx = r.data?.outTxs?.[0]?.hash ?? r.destTx ?? txHashes[1] ?? txHashes[0];
+    return { status, destTx: outTx, originTx: inTx };
   },
 };
 

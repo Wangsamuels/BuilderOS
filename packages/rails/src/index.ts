@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { getAddress, serializeSignature, type Hex } from "viem";
-import { network } from "@builderos/shared";
+import { env, network } from "@builderos/shared";
 
 /**
  * Rail adapters turn a 402 challenge into a NEAR purchase request, and a contract-built
@@ -218,7 +218,10 @@ export function buildPaymentHeaders(challenge: Challenge, signed: SignedPurchase
     return { "X-PAYMENT": encoded };
   }
   if ((challenge.rail === "mpp-tempo-charge" || challenge.rail === "mpp-tempo-session") && (signed.rail === "mpp-tempo-charge" || signed.rail === "mpp-tempo-session")) {
-    if (!network().tempo.enabled && !process.env.USE_SELLER_MESH) throw new Error("Tempo rail disabled (TEMPO_ENABLED=false)");
+    // Allow when Tempo is on, or offline seller-mesh (mock MPP sellers).
+    if (!network().tempo.enabled && !env().USE_SELLER_MESH) {
+      throw new Error("Tempo rail disabled (TEMPO_ENABLED=false) — set TEMPO_ENABLED to pay MPP services outside x402");
+    }
     const credential = { challenge: { id: challenge.mpp.id, method: challenge.mpp.method, intent: challenge.mpp.intent }, source: signed.source, payload: { type: "transaction", signature: signed.signed_tx } };
     return { Authorization: `Payment ${Buffer.from(JSON.stringify(credential)).toString("base64url")}` };
   }
