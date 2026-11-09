@@ -153,9 +153,10 @@ impl Contract {
         name: String,
         preset: String,
         deposit: NearToken,
-        #[callback_result] result: Result<Vec<u8>, PromiseError>,
     ) -> Option<Promise> {
-        if result.is_err() {
+        // Read the result by hand: the init call returns nothing, and `#[callback_result] Result<Vec<u8>, _>`
+        // tries to JSON-decode those empty bytes and panics ("EOF while parsing") on the *success* path.
+        if Self::promise_failed() {
             self.companies.remove(&slug);
             emit(
                 "company_create_failed",
@@ -222,6 +223,10 @@ impl Contract {
         pending.flush();
         emit("refund_claimed", json!({ "founder": who, "amount_yocto": owed.to_string() }));
         Promise::new(who).transfer(NearToken::from_yoctonear(owed))
+    }
+
+    fn promise_failed() -> bool {
+        matches!(env::promise_result_checked(0, 16_384), Err(PromiseError::Failed))
     }
 
     pub fn get_company(&self, slug: String) -> Option<CompanyMeta> {
@@ -305,8 +310,21 @@ mod tests {
             "D".into(),
             "p".into(),
             NearToken::from_near(7),
-            Err(near_sdk::PromiseError::Failed),
         )
+    }
+
+    #[test]
+    fn successful_create_keeps_slug_and_does_not_panic_on_empty_result() {
+        let mut f = factory();
+        f.companies.insert(
+            "demo".into(),
+            CompanyMeta { company_id: acc("demo.builderos-wang.testnet"), founder: acc("alice.testnet"), name: "D".into(), preset: "p".into() },
+        );
+        // `new` returns nothing: the promise result is empty bytes. This used to panic with "EOF while parsing".
+        ctx("builderos-wang.testnet", 30, vec![PromiseResult::Successful(vec![])]);
+        let r = f.on_company_created("demo".into(), acc("demo.builderos-wang.testnet"), acc("alice.testnet"), "D".into(), "p".into(), NearToken::from_near(7));
+        assert!(r.is_none(), "no refund on success");
+        assert!(f.get_company("demo".into()).is_some(), "slug stays registered");
     }
 
     #[test]

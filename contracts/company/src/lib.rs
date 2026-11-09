@@ -253,6 +253,10 @@ impl Contract {
         promise.unwrap()
     }
 
+    fn promise_failed() -> bool {
+        matches!(env::promise_result_checked(0, 16_384), Err(PromiseError::Failed))
+    }
+
     pub fn get_company(&self) -> CompanyView {
         CompanyView {
             founder: self.founder.clone(),
@@ -338,9 +342,10 @@ impl Contract {
         department_id: AccountId,
         founder: AccountId,
         deposit: NearToken,
-        #[callback_result] result: Result<Vec<u8>, PromiseError>,
     ) -> Option<Promise> {
-        if result.is_err() {
+        // Read the result by hand: the init call returns nothing, and `#[callback_result] Result<Vec<u8>, _>`
+        // tries to JSON-decode those empty bytes and panics ("EOF while parsing") on the *success* path.
+        if Self::promise_failed() {
             // Do not panic — that would roll back the remove (same bug as factory slug).
             self.departments.remove(&name);
             if let Some(i) = self.department_names.iter().position(|n| n == &name) {
@@ -987,5 +992,20 @@ mod tests {
         let mut c = company();
         ctx("founder.testnet", 1, 1_000);
         let _ = c.approve(vec!["nope".into()], None);
+    }
+
+    #[test]
+    fn department_callback_handles_empty_success_and_failure() {
+        let mut c = company();
+        with_build_dept(&mut c);
+        let ok = VMContextBuilder::new().current_account_id(acc("acme.builderos-wang.testnet")).predecessor_account_id(acc("acme.builderos-wang.testnet")).build();
+        testing_env!(ok, near_sdk::test_vm_config(), near_sdk::RuntimeFeesConfig::test(), Default::default(), vec![near_sdk::PromiseResult::Successful(vec![])]);
+        assert!(c.on_department_created("build".into(), acc("build.acme.builderos-wang.testnet"), acc("founder.testnet"), NearToken::from_millinear(4_500)).is_none());
+        assert_eq!(c.get_departments().len(), 1);
+
+        let bad = VMContextBuilder::new().current_account_id(acc("acme.builderos-wang.testnet")).predecessor_account_id(acc("acme.builderos-wang.testnet")).account_balance(NearToken::from_near(10)).build();
+        testing_env!(bad, near_sdk::test_vm_config(), near_sdk::RuntimeFeesConfig::test(), Default::default(), vec![near_sdk::PromiseResult::Failed]);
+        assert!(c.on_department_created("build".into(), acc("build.acme.builderos-wang.testnet"), acc("founder.testnet"), NearToken::from_millinear(4_500)).is_some(), "refund on failure");
+        assert_eq!(c.get_departments().len(), 0);
     }
 }

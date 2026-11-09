@@ -160,8 +160,12 @@ export const coreRoutes: FastifyPluginAsync = async (app) => {
     await authorize(account, p.companyId, ["admin"]);
     if (p.approvedAt) throw new HttpError(409, "plan already approved");
 
-    const depts = await db.select().from(departments).where(eq(departments.companyId, p.companyId));
-    if (!depts.length) throw new HttpError(409, "company has no departments indexed yet");
+    let depts = await db.select().from(departments).where(eq(departments.companyId, p.companyId));
+    if (!depts.length) {
+      await syncCompanyFromChain(p.companyId);
+      depts = await db.select().from(departments).where(eq(departments.companyId, p.companyId));
+    }
+    if (!depts.length) throw new HttpError(409, "company has no teams on chain yet — finish company setup first", "no_teams");
     const deptFor = (tag: string) => {
       const want = DEPT_FOR_TAG[tag] ?? "build";
       return (depts.find((d) => d.name === want) ?? depts[0]).id;
@@ -412,6 +416,29 @@ type CreationState = {
   pendingRefundYocto: string;
 };
 
+/**
+ * Write the company and its teams into the read cache straight from chain. The indexer normally does this
+ * from `company_created` / `department_created`, but if an event was missed (or a callback failed after
+ * the account was created), the dashboard and plan approval would never see the company.
+ */
+export async function syncCompanyFromChain(
+  companyId: string,
+  company?: { founder: string; name: string } | null,
+  list?: Array<{ name: string; department_id: string }>,
+) {
+  const c = company ?? (await views.getCompany(companyId).catch(() => null));
+  if (!c) return false;
+  const teams = list ?? (await views.getDepartments(companyId).catch(() => []));
+  const db = getDb();
+  await db
+    .insert(companies)
+    .values({ id: companyId, accountId: companyId, name: c.name, network: process.env.NETWORK ?? "testnet", founderAccount: c.founder })
+    .onConflictDoNothing();
+  for (const d of teams)
+    await db.insert(departments).values({ id: d.department_id, companyId, accountId: d.department_id, name: d.name }).onConflictDoNothing();
+  return true;
+}
+
 /** Everything about a create, read from chain: factory slug record, company account, its departments, refunds. */
 async function creationState(slug: string, account: string): Promise<CreationState> {
   const companyId = companyAccount(slug);
@@ -427,6 +454,7 @@ async function creationState(slug: string, account: string): Promise<CreationSta
     const [list, company] = await Promise.all([views.getDepartments(companyId).catch(() => []), views.getCompany(companyId).catch(() => null)]);
     depts = (list ?? []).map((d) => ({ name: d.name, departmentId: d.department_id }));
     dailyCap = company?.daily_cap ?? null;
+    if (company) await syncCompanyFromChain(companyId, company, list ?? []).catch(() => {});
   }
   return {
     slug,
