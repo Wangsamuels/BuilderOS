@@ -12,7 +12,7 @@ import {
   type UnsignedTx,
 } from "@builderos/shared";
 import { companies, departments, desc, eq, getDb, hires, inArray, plans, sellerOptions, tasks } from "@builderos/db";
-import { companyAccount, tx, views } from "@builderos/near";
+import { companyAccount, companyCreateFunding, tx, views } from "@builderos/near";
 import { estimate, type Tier } from "@builderos/router";
 import { listHireableAgents, nicheNecessity, HIRE_NECESSITY_MIN, plan as runPlanner, rankHireCandidates, ROLE_FOR_TAG, topoOrder } from "@builderos/orchestrator";
 import { parseChallenges, challengeAmount } from "@builderos/rails";
@@ -53,7 +53,12 @@ export const coreRoutes: FastifyPluginAsync = async (app) => {
       ...body.departments.map((d) => tx.createDepartment(companyId, d)),
       tx.setCaps(companyId, { dailyCap: body.dailyCap }),
     ];
-    return { companyId, transactions };
+    return {
+      companyId,
+      transactions,
+      /** Exact NEAR deposits the wallet must cover when signing (testnet faucet CTA). */
+      funding: companyCreateFunding(body.departments.length),
+    };
   });
 
   // ---------- planner ----------

@@ -180,6 +180,18 @@ describe("niche hire gate", () => {
   });
 });
 
+describe("company create funding (testnet deposit CTA)", () => {
+  it("prices default 3-department create at 5 + 3×3 + 1 gas buffer NEAR", async () => {
+    const { companyCreateFunding, yoctoToNear, CREATE_COMPANY_DEPOSIT_YOCTO } = await import("../../packages/near/src/funding.js");
+    expect(yoctoToNear(CREATE_COMPANY_DEPOSIT_YOCTO)).toBe("5");
+    const f = companyCreateFunding(3);
+    expect(f.totalDepositNear).toBe("14");
+    expect(f.recommendedNear).toBe("15");
+    expect(f.departmentCount).toBe(3);
+    expect(f.faucetUrl).toBeTruthy();
+  });
+});
+
 describe("bridge rules", () => {
   it("tops up below 25% or when a purchase exceeds the pocket", () => {
     expect(needsTopup(100n, 20n, 0n)).toBe(true);

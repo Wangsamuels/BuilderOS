@@ -1,8 +1,14 @@
 import type { FastifyPluginAsync, FastifyRequest } from "fastify";
 import { randomBytes } from "node:crypto";
 import { ChallengeQuery, VerifyBody, env, HttpError } from "@builderos/shared";
-import { authChallenges, authSessions, eq, getDb } from "@builderos/db";
-import { resolveLoginAccountId, verifyNep413Flexible } from "@builderos/near";
+import { authChallenges, authSessions, eq, getDb, inArray, plans } from "@builderos/db";
+import {
+  companyCreateFunding,
+  resolveLoginAccountId,
+  verifyNep413Flexible,
+  viewAccount,
+  yoctoToNear,
+} from "@builderos/near";
 import { COOKIE, cookieOptions, issueSession, requireAccount, visibleCompanies } from "../auth.js";
 import { originAllowed, parse } from "../app.js";
 
@@ -91,11 +97,70 @@ export const authRoutes: FastifyPluginAsync = async (app) => {
     return { ok: true };
   });
 
-  const me = async (req: FastifyRequest) => {
-    const account = requireAccount(req);
-    return { accountId: account, companies: await visibleCompanies(account) };
-  };
+  /**
+   * Session + setup progress for dashboard banner / Describe funding CTA.
+   * Sign-in alone creates the account — Describe is not part of auth.
+   */
+  async function buildSetup(account: string) {
+    const companies = await visibleCompanies(account);
+    const funding = companyCreateFunding(3);
+    const bal = await viewAccount(account).catch(() => ({
+      exists: false,
+      availableYocto: "0",
+      amountYocto: "0",
+      lockedYocto: "0",
+    }));
+    const available = BigInt(bal.availableYocto);
+    const need = BigInt(funding.recommendedYocto);
+    const hasCompany = companies.length > 0;
+    const fundedEnough = hasCompany || available >= need;
+
+    let hasPlan = false;
+    if (companies.length) {
+      const rows = await getDb().select({ id: plans.id }).from(plans).where(inArray(plans.companyId, companies)).limit(1);
+      hasPlan = rows.length > 0;
+    }
+
+    const steps = [
+      { id: "account", done: true as const, label: "Account created" },
+      {
+        id: "fund",
+        done: fundedEnough,
+        label: hasCompany ? "Wallet funded" : `Add ~${funding.recommendedNear} testnet NEAR`,
+        requiredNear: funding.recommendedNear,
+      },
+      { id: "company", done: hasCompany, label: "Create your company" },
+      { id: "describe", done: hasPlan, label: "Describe your product" },
+    ];
+    const completed = steps.filter((s) => s.done).length;
+    const next = steps.find((s) => !s.done)?.id ?? null;
+
+    return {
+      accountId: account,
+      companies,
+      balance: {
+        exists: bal.exists,
+        availableYocto: bal.availableYocto,
+        availableNear: yoctoToNear(available),
+        amountYocto: bal.amountYocto,
+        lockedYocto: bal.lockedYocto,
+      },
+      funding,
+      setup: {
+        steps,
+        completed,
+        total: steps.length,
+        next,
+        /** Soft banner on dashboard when setup incomplete — FE owns copy. */
+        showBanner: next !== null,
+      },
+    };
+  }
+
+  const me = async (req: FastifyRequest) => buildSetup(requireAccount(req));
   app.get("/me", me);
   /** Alias for FE contract draft that expected /v1/auth/session */
   app.get("/session", me);
+  /** Explicit setup payload (same as /me) for dashboard progress + Describe deposit CTA. */
+  app.get("/setup", async (req) => buildSetup(requireAccount(req)));
 };

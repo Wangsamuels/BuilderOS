@@ -53,6 +53,40 @@ export async function accessKeys(accountId: string): Promise<AccessKey[]> {
   return res.keys;
 }
 
+export type AccountView = {
+  exists: boolean;
+  /** Liquid balance in yoctoNEAR (amount − locked when present). */
+  availableYocto: string;
+  amountYocto: string;
+  lockedYocto: string;
+};
+
+/** view_account; nonexistent / unfunded implicit accounts → exists:false, zeros. */
+export async function viewAccount(accountId: string): Promise<AccountView> {
+  try {
+    const res = await rpc<{ amount: string; locked: string }>("query", {
+      request_type: "view_account",
+      finality: "final",
+      account_id: accountId,
+    });
+    const amount = BigInt(res.amount ?? "0");
+    const locked = BigInt(res.locked ?? "0");
+    const available = amount > locked ? amount - locked : 0n;
+    return {
+      exists: true,
+      availableYocto: available.toString(),
+      amountYocto: amount.toString(),
+      lockedYocto: locked.toString(),
+    };
+  } catch (e: any) {
+    const msg = String(e?.message ?? e ?? "");
+    if (/does not exist|UNKNOWN_ACCOUNT|InvalidAccount|AccountDoesNotExist/i.test(msg)) {
+      return { exists: false, availableYocto: "0", amountYocto: "0", lockedYocto: "0" };
+    }
+    throw e;
+  }
+}
+
 export async function finalBlock() {
   return rpc<any>("block", { finality: "final" });
 }
