@@ -158,7 +158,22 @@ export const coreRoutes: FastifyPluginAsync = async (app) => {
     const [p] = await db.select().from(plans).where(eq(plans.id, req.params.id));
     if (!p) throw new HttpError(404, "plan not found");
     await authorize(account, p.companyId, ["admin"]);
-    if (p.approvedAt) throw new HttpError(409, "plan already approved");
+    // Approval is recorded before the founder signs. If signing was cancelled or refused, the tasks are still
+    // "pending" (no task_assigned seen yet), so hand back the same assign_task calls instead of a dead-end 409.
+    // Re-sending is safe: assign_task overwrites the task with identical values.
+    if (p.approvedAt) {
+      const existing = await db.select().from(tasks).where(eq(tasks.planId, p.id));
+      const pending = existing.filter((r) => r.status === "pending");
+      if (!pending.length) throw new HttpError(409, "plan already approved and assigned on chain", "plan_already_approved");
+      const byId = new Map(existing.map((r) => [r.id, r]));
+      const order = topoOrder(pending.map((r) => ({ key: r.id, dependsOn: r.dependsOn.filter((d) => byId.get(d)?.status === "pending") })) as any);
+      const calls = order.map((id) => {
+        const r = byId.get(id)!;
+        return tx.assignTaskCall(r.departmentId ?? `build.${p.companyId}`, { taskId: r.id, tier: r.tier ?? p.tier, cap: r.cap ?? "0", tag: r.tag, agentRole: ROLE_FOR_TAG[r.tag] ?? "backend", dependsOn: r.dependsOn });
+      });
+      const transactions = tx.deptCalls(p.companyId, calls).map((t) => ({ ...t, signerId: account }));
+      return { tasks: pending, transactions, resumed: true };
+    }
 
     let depts = await db.select().from(departments).where(eq(departments.companyId, p.companyId));
     if (!depts.length) {
@@ -205,8 +220,8 @@ export const coreRoutes: FastifyPluginAsync = async (app) => {
       await t.update(plans).set({ approvedAt: new Date() }).where(eq(plans.id, p.id));
     });
     // assign_task goes through company.dept_call (departments only accept the company as caller).
-    const transactions: UnsignedTx[] = tx.deptCalls(p.companyId, calls);
-    return { tasks: rows, transactions };
+    const transactions: UnsignedTx[] = tx.deptCalls(p.companyId, calls).map((t) => ({ ...t, signerId: account }));
+    return { tasks: rows, transactions, resumed: false };
   });
 
   app.get("/estimate", async (req) => {

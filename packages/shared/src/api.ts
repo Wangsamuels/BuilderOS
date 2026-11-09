@@ -181,6 +181,8 @@ export const PushSubscriptionBody = z.object({
 
 /** wallet-selector compatible transaction shape, so the web app can call signAndSendTransactions directly. */
 export type UnsignedTx = {
+  /** The account that must sign (the caller). Omitted on txs any signed-in wallet may sign. */
+  signerId?: string;
   receiverId: string;
   actions: Array<{
     type: "FunctionCall";
