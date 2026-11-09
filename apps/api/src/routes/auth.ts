@@ -5,12 +5,17 @@ import { authChallenges, authSessions, eq, getDb, inArray, plans } from "@builde
 import {
   companyCreateFunding,
   resolveLoginAccountId,
+  sendNear,
+  serviceAccount,
   verifyNep413Flexible,
   viewAccount,
   yoctoToNear,
 } from "@builderos/near";
 import { COOKIE, cookieOptions, issueSession, requireAccount, visibleCompanies } from "../auth.js";
 import { originAllowed, parse } from "../app.js";
+
+/** One successful drip per account per process window (Heroku restart clears). */
+const fundedOnce = new Set<string>();
 
 const CHALLENGE_TTL_MS = 5 * 60_000;
 
@@ -163,4 +168,32 @@ export const authRoutes: FastifyPluginAsync = async (app) => {
   app.get("/session", me);
   /** Explicit setup payload (same as /me) for dashboard progress + Describe deposit CTA. */
   app.get("/setup", async (req) => buildSetup(requireAccount(req)));
+
+  /**
+   * Testnet-only: drip recommendedNear from TESTNET_SPONSOR_* to the signed-in account.
+   * Also creates the implicit account on first transfer (near-faucet.io rejects brand-new Privy ids).
+   * FE: "Add testnet NEAR for me" when funding.autoFundAvailable.
+   */
+  app.post("/fund-testnet", { config: ipLimit }, async (req) => {
+    const account = requireAccount(req);
+    const e = env();
+    if (e.NETWORK !== "testnet") throw new HttpError(400, "fund-testnet is testnet only", "wrong_network");
+    if (!e.TESTNET_SPONSOR_ACCOUNT_ID || !e.TESTNET_SPONSOR_PRIVATE_KEY) {
+      throw new HttpError(503, "testnet sponsor not configured", "sponsor_unavailable");
+    }
+    const funding = companyCreateFunding(3);
+    const need = BigInt(e.TESTNET_SPONSOR_AMOUNT_YOCTO ?? funding.recommendedYocto);
+    const bal = await viewAccount(account).catch(() => ({ availableYocto: "0", exists: false }));
+    if (BigInt(bal.availableYocto) >= need) {
+      return { ok: true, skipped: true, reason: "already_funded", balanceYocto: bal.availableYocto };
+    }
+    if (fundedOnce.has(account)) {
+      throw new HttpError(429, "already requested a drip this session — wait or refresh balance", "fund_rate_limited");
+    }
+    const sponsor = await serviceAccount(e.TESTNET_SPONSOR_ACCOUNT_ID, e.TESTNET_SPONSOR_PRIVATE_KEY);
+    const { txHash } = await sendNear(sponsor, account, need);
+    fundedOnce.add(account);
+    req.log.info({ account, txHash, amount: need.toString() }, "testnet sponsor drip");
+    return { ok: true, txHash, amountYocto: need.toString(), amountNear: yoctoToNear(need) };
+  });
 };

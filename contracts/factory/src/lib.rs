@@ -28,6 +28,9 @@ fn emit(event: &str, data: near_sdk::serde_json::Value) {
 
 const COMPANY_WASM: &[u8] = include_bytes!("../../wasm/company.wasm");
 
+/// company.wasm ≈ 600KB × 10^19 yocto/byte ≈ 6.15 NEAR; keep margin for account + init state.
+const MIN_CREATE_DEPOSIT: NearToken = NearToken::from_near(7);
+
 #[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Clone, Debug)]
 #[serde(crate = "near_sdk::serde")]
 #[borsh(crate = "near_sdk::borsh")]
@@ -90,7 +93,7 @@ impl Contract {
         );
         require!(!self.companies.contains_key(&slug), "slug taken");
         let deposit = env::attached_deposit();
-        require!(deposit >= NearToken::from_millinear(2500), "attach >= 2.5 NEAR");
+        require!(deposit >= MIN_CREATE_DEPOSIT, "attach >= 7 NEAR (company wasm storage)");
 
         let founder = env::predecessor_account_id();
         let company_id: AccountId = format!("{}.{}", slug, env::current_account_id())
@@ -131,11 +134,14 @@ impl Contract {
             )
             .then(
                 Self::ext(env::current_account_id())
-                    .with_static_gas(Gas::from_tgas(15))
-                    .on_company_created(slug, company_id, founder, name, preset),
+                    .with_static_gas(Gas::from_tgas(30))
+                    .on_company_created(slug, company_id, founder, name, preset, deposit),
             )
     }
 
+    /// On failure: free the slug and refund `deposit` to the founder.
+    /// Must NOT panic after `remove` — a panic rolls back state changes in this receipt
+    /// (that was why "slug taken" stuck after LackBalanceForState).
     #[private]
     pub fn on_company_created(
         &mut self,
@@ -144,12 +150,28 @@ impl Contract {
         founder: AccountId,
         name: String,
         preset: String,
-        #[callback_result] result: Result<(), PromiseError>,
-    ) {
+        deposit: NearToken,
+        #[callback_result] result: Result<Vec<u8>, PromiseError>,
+    ) -> Option<Promise> {
         if result.is_err() {
             self.companies.remove(&slug);
-            env::panic_str("company create failed");
+            emit(
+                "company_create_failed",
+                json!({
+                    "slug": slug,
+                    "company_id": company_id,
+                    "founder": founder,
+                    "refund_yocto": deposit.as_yoctonear().to_string(),
+                }),
+            );
+            // Bounced sub-account transfer lands on the factory — refund the signer.
+            // Must not panic: panic rolls back slug removal (caused "slug taken" after storage fails).
+            if deposit.as_yoctonear() > 0 {
+                return Some(Promise::new(founder).transfer(deposit));
+            }
+            return None;
         }
+
         emit(
             "company_created",
             json!({
@@ -159,6 +181,7 @@ impl Contract {
                 "preset": preset,
             }),
         );
+        None
     }
 
     pub fn get_company(&self, slug: String) -> Option<CompanyMeta> {
@@ -181,5 +204,19 @@ impl Contract {
             self.worker_id.clone(),
             self.verifier_id.clone(),
         )
+    }
+
+    /// Owner: free a reserved slug after a failed create (pre-fix cleanup / ops).
+    pub fn admin_clear_slug(&mut self, slug: String) {
+        require!(env::predecessor_account_id() == self.owner_id, "owner only");
+        self.companies.remove(&slug);
+        emit("slug_cleared", json!({ "slug": slug }));
+    }
+
+    /// Owner: send NEAR from the factory (e.g. refund stuck create deposits).
+    pub fn admin_transfer(&mut self, to: AccountId, amount: NearToken) -> Promise {
+        require!(env::predecessor_account_id() == self.owner_id, "owner only");
+        require!(amount.as_yoctonear() > 0, "amount > 0");
+        Promise::new(to).transfer(amount)
     }
 }

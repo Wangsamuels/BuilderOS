@@ -1,13 +1,14 @@
 import { env, network } from "@builderos/shared";
 
 /**
- * Storage deposits attached on create txs (must be ≥ contract minimums).
- * Factory: ≥ 2.5 NEAR · Department: ≥ 1 NEAR each.
+ * Storage deposits attached on create txs (must cover wasm storage on NEAR).
+ * company.wasm ≈ 600KB → ~6.15 NEAR; department.wasm ≈ 300KB → ~3.07 NEAR.
+ * Contract mins: create_company ≥ 7 NEAR, create_department ≥ 4 NEAR.
  */
-export const CREATE_COMPANY_DEPOSIT_YOCTO = 2_500_000_000_000_000_000_000_000n; // 2.5 NEAR
-export const CREATE_DEPARTMENT_DEPOSIT_YOCTO = 1_000_000_000_000_000_000_000_000n; // 1 NEAR
+export const CREATE_COMPANY_DEPOSIT_YOCTO = 7_000_000_000_000_000_000_000_000n; // 7 NEAR
+export const CREATE_DEPARTMENT_DEPOSIT_YOCTO = 4_000_000_000_000_000_000_000_000n; // 4 NEAR
 /** Extra headroom for gas after create (not attached as deposit). */
-export const CREATE_COMPANY_GAS_BUFFER_YOCTO = 500_000_000_000_000_000_000_000n; // 0.5 NEAR
+export const CREATE_COMPANY_GAS_BUFFER_YOCTO = 1_000_000_000_000_000_000_000_000n; // 1 NEAR
 
 const YOCTO_PER_NEAR = 10n ** 24n;
 
@@ -27,7 +28,7 @@ export function nearToYocto(near: string): bigint {
 
 /**
  * NEAR the founder must cover to sign the default company create bundle.
- * With TESTNET_SPONSOR_* configured, FE should auto-fund instead of blocking the UI.
+ * Default 3 teams → 7 + 4×3 + 1 = 20 NEAR recommended.
  */
 export function companyCreateFunding(departmentCount = 3) {
   const depts = BigInt(Math.max(0, departmentCount));
@@ -57,14 +58,12 @@ export function companyCreateFunding(departmentCount = 3) {
       { action: "gas_buffer", near: yoctoToNear(CREATE_COMPANY_GAS_BUFFER_YOCTO) },
     ],
     faucetUrl: n.id === "testnet" ? "https://near-faucet.io/" : null,
-    /** When true, FE should call POST /v1/auth/fund-testnet — do not hard-wall the dashboard. */
     autoFundAvailable,
-    /** Physics: company create always needs storage NEAR; user may not have to supply it on testnet. */
     userMustDeposit: !autoFundAvailable,
     hint: autoFundAvailable
       ? `Testnet will auto-fund ~${yoctoToNear(recommended)} NEAR so you can create a company without a faucet wall.`
       : n.id === "testnet"
-        ? `Need ~${yoctoToNear(recommended)} testnet NEAR to create a company (2.5 + 1×${depts} teams + gas). Prefer configuring TESTNET_SPONSOR so signup stays frictionless.`
+        ? `Need ~${yoctoToNear(recommended)} testnet NEAR to create a company (7 NEAR company wasm + 4 NEAR × ${depts} teams + gas).`
         : `Fund about ${yoctoToNear(recommended)} NEAR before creating a company.`,
   };
 }

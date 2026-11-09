@@ -162,7 +162,8 @@ impl Contract {
         require!(!self.frozen, "frozen");
         require!(DEPARTMENT_WASM.len() > 10_000, "department wasm missing — run contracts/build.sh");
         let deposit = env::attached_deposit();
-        require!(deposit >= NearToken::from_near(1), "attach >= 1 NEAR for dept storage");
+        // department.wasm ≈ 300KB × 10^19 ≈ 3.07 NEAR storage; keep margin.
+        require!(deposit >= NearToken::from_near(4), "attach >= 4 NEAR for dept storage");
         let dept_id: AccountId = format!("{}.{}", name, env::current_account_id())
             .parse()
             .expect("invalid dept id");
@@ -181,6 +182,7 @@ impl Contract {
         }))
         .unwrap();
 
+        let founder = env::predecessor_account_id();
         Promise::new(dept_id.clone())
             .create_account()
             .transfer(deposit)
@@ -194,8 +196,8 @@ impl Contract {
             )
             .then(
                 Self::ext(env::current_account_id())
-                    .with_static_gas(Gas::from_tgas(10))
-                    .on_department_created(name, dept_id),
+                    .with_static_gas(Gas::from_tgas(20))
+                    .on_department_created(name, dept_id, founder, deposit),
             )
     }
 
@@ -204,11 +206,17 @@ impl Contract {
         &mut self,
         name: String,
         department_id: AccountId,
-        #[callback_result] result: Result<(), PromiseError>,
-    ) {
+        founder: AccountId,
+        deposit: NearToken,
+        #[callback_result] result: Result<Vec<u8>, PromiseError>,
+    ) -> Option<Promise> {
         if result.is_err() {
+            // Do not panic — that would roll back the remove (same bug as factory slug).
             self.departments.remove(&name);
-            env::panic_str("department create failed");
+            if deposit.as_yoctonear() > 0 {
+                return Some(Promise::new(founder).transfer(deposit));
+            }
+            return None;
         }
         emit(
             "department_created",
@@ -218,6 +226,7 @@ impl Contract {
                 "name": name,
             }),
         );
+        None
     }
 
     #[payable]

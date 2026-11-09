@@ -23,11 +23,12 @@ export const departmentAccount = (companyId: string, dept: string) => `${dept}.$
 
 export const tx = {
   createCompany: (a: { slug: string; name: string; preset: string; dailyCap: string; presetHash?: string }) =>
-    // Storage for the company account (factory min 2.5 NEAR). On testnet, sponsor can drip this to the founder first.
-    call(network().factory, "create_company", { slug: a.slug, name: a.name, preset: a.preset, daily_cap: a.dailyCap, preset_hash: a.presetHash ?? null }, 300, "2500000000000000000000000"),
+    // company.wasm ≈ 6.15 NEAR storage — factory requires ≥ 7 NEAR attached.
+    call(network().factory, "create_company", { slug: a.slug, name: a.name, preset: a.preset, daily_cap: a.dailyCap, preset_hash: a.presetHash ?? null }, 300, "7000000000000000000000000"),
 
   createDepartment: (companyId: string, d: { name: string; budget: string; perTxLimit: string }) =>
-    call(companyId, "create_department", { name: d.name, budget: d.budget, per_tx_limit: d.perTxLimit }, 200, "1000000000000000000000000"),
+    // department.wasm ≈ 3.07 NEAR storage — company requires ≥ 4 NEAR attached.
+    call(companyId, "create_department", { name: d.name, budget: d.budget, per_tx_limit: d.perTxLimit }, 200, "4000000000000000000000000"),
 
   setCaps: (companyId: string, a: { dailyCap: string }) => call(companyId, "set_caps", { daily_cap: a.dailyCap }, 30, ONE_YOCTO),
 

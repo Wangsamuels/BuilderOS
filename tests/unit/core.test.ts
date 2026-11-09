@@ -181,12 +181,14 @@ describe("niche hire gate", () => {
 });
 
 describe("company create funding (testnet deposit CTA)", () => {
-  it("prices default 3-department create at 5 + 3×3 + 1 gas buffer NEAR", async () => {
+  it("prices default 3-department create at 7 + 4×3 + 1 gas buffer NEAR (wasm storage)", async () => {
     const { companyCreateFunding, yoctoToNear, CREATE_COMPANY_DEPOSIT_YOCTO } = await import("../../packages/near/src/funding.js");
-    expect(yoctoToNear(CREATE_COMPANY_DEPOSIT_YOCTO)).toBe("5");
+    expect(yoctoToNear(CREATE_COMPANY_DEPOSIT_YOCTO)).toBe("7");
     const f = companyCreateFunding(3);
-    expect(f.totalDepositNear).toBe("14");
-    expect(f.recommendedNear).toBe("15");
+    expect(f.createCompanyNear).toBe("7");
+    expect(f.perDepartmentNear).toBe("4");
+    expect(f.totalDepositNear).toBe("19");
+    expect(f.recommendedNear).toBe("20");
     expect(f.departmentCount).toBe(3);
     expect(f.faucetUrl).toBeTruthy();
   });
