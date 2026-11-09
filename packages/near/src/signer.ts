@@ -35,3 +35,9 @@ export async function callAs(account: Account, c: ServiceCall) {
   const value = status?.SuccessValue ? JSON.parse(Buffer.from(status.SuccessValue, "base64").toString("utf8") || "null") : null;
   return { txHash: outcome.transaction.hash as string, value, outcome };
 }
+
+/** FullAccess sponsor transfer (testnet faucet drip). Do not use request-only worker keys. */
+export async function sendNear(from: Account, toAccountId: string, amountYocto: bigint) {
+  const outcome = await from.sendMoney(toAccountId, amountYocto);
+  return { txHash: outcome.transaction.hash as string };
+}

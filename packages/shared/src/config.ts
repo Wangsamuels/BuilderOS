@@ -75,6 +75,15 @@ const EnvSchema = z.object({
   SELLER_MESH_URL: z.string().default("http://localhost:4100"),
   USE_SELLER_MESH: bool,
 
+  /**
+   * Testnet-only: FullAccess account that can drip NEAR to new Privy wallets so founders
+   * do not manually faucet before create_company. Never set on mainnet.
+   */
+  TESTNET_SPONSOR_ACCOUNT_ID: z.string().optional(),
+  TESTNET_SPONSOR_PRIVATE_KEY: z.string().optional(),
+  /** YoctoNEAR per drip (default ~6.5 NEAR ≈ lowered create deposits + buffer). */
+  TESTNET_SPONSOR_AMOUNT_YOCTO: z.string().optional(),
+
   LOG_LEVEL: z.string().default("info"),
 });
 
