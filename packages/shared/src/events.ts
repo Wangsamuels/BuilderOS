@@ -20,6 +20,16 @@ const opt = <T extends z.ZodTypeAny>(t: T) => t.optional().nullable();
  * never drops an event into dead letters; only the fields receipts need are required.
  */
 export const EventSchemas = {
+  seller_allowed: z.looseObject({ department_id: z.string(), seller_id: z.string(), pay_to: z.string() }),
+  seller_removed: z.looseObject({ department_id: z.string(), seller_id: z.string() }),
+  agent_fired: z.looseObject({ department_id: z.string(), public_key: z.string() }),
+  upgrade_proposed: z.looseObject({ company_id: z.string(), target: z.string(), code_hash: z.string(), ready_at_ms: z.union([z.number(), z.string()]) }),
+  upgrade_cancelled: z.looseObject({ company_id: z.string(), target: z.string() }),
+  upgrade_applied: z.looseObject({ target: z.string(), code_hash: z.string() }),
+  company_create_failed: z.looseObject({ slug: z.string(), company_id: z.string(), founder: z.string(), refund_yocto: opt(amount) }),
+  slug_cleared: z.looseObject({ slug: z.string() }),
+  refund_pending: z.looseObject({ founder: z.string(), amount_yocto: amount }),
+  refund_claimed: z.looseObject({ founder: z.string(), amount_yocto: amount }),
   company_created: z.looseObject({ company_id: z.string(), founder: z.string(), name: opt(z.string()), preset: opt(z.string()) }),
   department_created: z.looseObject({ company_id: z.string(), department_id: z.string(), name: opt(z.string()), contract_hash: opt(z.string()) }),
   agent_registered: z.looseObject({ department_id: z.string(), public_key: z.string(), role: z.string(), max_tier: opt(z.string()) }),

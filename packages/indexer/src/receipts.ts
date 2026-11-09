@@ -112,6 +112,13 @@ export function buildReceipt(event: EventName, d: Record<string, any>, signer: s
     case "policy_changed":
     case "frozen":
     case "unfrozen":
+    case "upgrade_proposed":
+    case "upgrade_cancelled":
+    case "upgrade_applied":
+    case "agent_registered":
+    case "agent_fired":
+    case "seller_allowed":
+    case "seller_removed":
       return { kind: "keys_policy", actor: signer, payload: { event, ...d } };
     default:
       return { kind: "other", actor: signer, payload: { event, ...d } };

@@ -1,7 +1,7 @@
 import type { FastifyPluginAsync, FastifyRequest } from "fastify";
 import { randomBytes } from "node:crypto";
-import { ChallengeQuery, VerifyBody, env, HttpError } from "@builderos/shared";
-import { authChallenges, authSessions, eq, getDb, inArray, plans } from "@builderos/db";
+import { ChallengeQuery, VerifyBody, env, network, HttpError } from "@builderos/shared";
+import { authChallenges, authSessions, eq, getDb, inArray, plans, testnetDrips } from "@builderos/db";
 import {
   companyCreateFunding,
   resolveLoginAccountId,
@@ -9,13 +9,19 @@ import {
   serviceAccount,
   verifyNep413Flexible,
   viewAccount,
+  views,
   yoctoToNear,
 } from "@builderos/near";
 import { COOKIE, cookieOptions, issueSession, requireAccount, visibleCompanies } from "../auth.js";
 import { originAllowed, parse } from "../app.js";
 
-/** One successful drip per account per process window (Heroku restart clears). */
-const fundedOnce = new Set<string>();
+/** Accounts that must never be used as the testnet sponsor (their NEAR backs storage + refunds). */
+function sponsorIsProtected(id: string) {
+  const n = network();
+  const e = env();
+  return [n.factory, n.registry, e.WORKER_ACCOUNT_ID, e.VERIFIER_ACCOUNT_ID].includes(id);
+}
+const DRIP_HEADROOM_YOCTO = 500_000_000_000_000_000_000_000n; // +0.5 NEAR for gas on the create txs
 
 const CHALLENGE_TTL_MS = 5 * 60_000;
 
@@ -126,6 +132,8 @@ export const authRoutes: FastifyPluginAsync = async (app) => {
       hasPlan = rows.length > 0;
     }
 
+    const pendingRefund = BigInt(await views.getPendingRefund(account).catch(() => "0"));
+
     const steps = [
       { id: "account", done: true as const, label: "Account created" },
       {
@@ -151,6 +159,8 @@ export const authRoutes: FastifyPluginAsync = async (app) => {
         lockedYocto: bal.lockedYocto,
       },
       funding,
+      /** A failed create the factory couldn't refund at once → POST /v1/companies/claim-refund. */
+      pendingRefund: { yocto: pendingRefund.toString(), near: yoctoToNear(pendingRefund) },
       setup: {
         steps,
         completed,
@@ -174,26 +184,46 @@ export const authRoutes: FastifyPluginAsync = async (app) => {
    * Also creates the implicit account on first transfer (near-faucet.io rejects brand-new Privy ids).
    * FE: "Add testnet NEAR for me" when funding.autoFundAvailable.
    */
-  app.post("/fund-testnet", { config: ipLimit }, async (req) => {
+  app.post("/fund-testnet", { config: { rateLimit: { max: 3, timeWindow: "1 hour", keyGenerator: (r: { ip: string }) => r.ip } } }, async (req) => {
     const account = requireAccount(req);
     const e = env();
     if (e.NETWORK !== "testnet") throw new HttpError(400, "fund-testnet is testnet only", "wrong_network");
     if (!e.TESTNET_SPONSOR_ACCOUNT_ID || !e.TESTNET_SPONSOR_PRIVATE_KEY) {
       throw new HttpError(503, "testnet sponsor not configured", "sponsor_unavailable");
     }
+    if (sponsorIsProtected(e.TESTNET_SPONSOR_ACCOUNT_ID)) {
+      req.log.error({ sponsor: e.TESTNET_SPONSOR_ACCOUNT_ID }, "TESTNET_SPONSOR_ACCOUNT_ID is the factory/registry/worker/verifier — refusing to drip");
+      throw new HttpError(503, "testnet sponsor misconfigured", "sponsor_unavailable");
+    }
     const funding = companyCreateFunding(3);
-    const need = BigInt(e.TESTNET_SPONSOR_AMOUNT_YOCTO ?? funding.recommendedYocto);
+    const target = BigInt(e.TESTNET_SPONSOR_AMOUNT_YOCTO ?? funding.recommendedYocto);
     const bal = await viewAccount(account).catch(() => ({ availableYocto: "0", exists: false }));
-    if (BigInt(bal.availableYocto) >= need) {
+    const have = BigInt(bal.availableYocto);
+    if (have >= target) {
       return { ok: true, skipped: true, reason: "already_funded", balanceYocto: bal.availableYocto };
     }
-    if (fundedOnce.has(account)) {
-      throw new HttpError(429, "already requested a drip this session — wait or refresh balance", "fund_rate_limited");
-    }
+    // One drip per account, ever (persisted — survives dyno restarts).
+    const db = getDb();
+    const [prior] = await db.select().from(testnetDrips).where(eq(testnetDrips.account, account));
+    if (prior) throw new HttpError(429, "this account already received testnet NEAR — use the faucet for more", "fund_rate_limited");
+    // Send only the shortfall (plus a little gas headroom), never the full amount.
+    const need = target - have + DRIP_HEADROOM_YOCTO;
     const sponsor = await serviceAccount(e.TESTNET_SPONSOR_ACCOUNT_ID, e.TESTNET_SPONSOR_PRIVATE_KEY);
-    const { txHash } = await sendNear(sponsor, account, need);
-    fundedOnce.add(account);
-    req.log.info({ account, txHash, amount: need.toString() }, "testnet sponsor drip");
-    return { ok: true, txHash, amountYocto: need.toString(), amountNear: yoctoToNear(need) };
+    // Reserve the row first so two parallel requests can't both drip.
+    const reserved = await db
+      .insert(testnetDrips)
+      .values({ account, amount: need.toString(), txHash: "pending", ip: req.ip })
+      .onConflictDoNothing()
+      .returning({ account: testnetDrips.account });
+    if (!reserved.length) throw new HttpError(429, "this account already received testnet NEAR", "fund_rate_limited");
+    try {
+      const { txHash } = await sendNear(sponsor, account, need);
+      await db.update(testnetDrips).set({ txHash }).where(eq(testnetDrips.account, account));
+      req.log.info({ account, txHash, amount: need.toString() }, "testnet sponsor drip");
+      return { ok: true, txHash, amountYocto: need.toString(), amountNear: yoctoToNear(need) };
+    } catch (err) {
+      await db.delete(testnetDrips).where(eq(testnetDrips.account, account));
+      throw err;
+    }
   });
 };

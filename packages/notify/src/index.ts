@@ -130,6 +130,8 @@ export function alertFor(event: string, d: Record<string, any>, companyId: strin
     case "purchase_yielded":
       if (d.reason === "daily_cap")
         return { kind: "daily_cap", companyId, title: "Daily spending cap reached", body: "New purchases are waiting on today's card.", url: link("/approvals") };
+      if (d.reason === "new_seller")
+        return { kind: "seller_choice", companyId, title: "New seller wants to be paid", body: `${d.seller_id ?? "A seller"} asks for ${d.amount ?? "?"} to ${d.pay_to ?? "an unknown address"}. Approve once, or always.`, url: link("/approvals") };
       if (d.reason === "seller_choice") return { kind: "seller_choice", companyId, title: "Pick a seller", body: `A task needs a ${d.service ?? "service"} seller.`, url: link("/approvals") };
       return { kind: "approval", companyId, title: "Approval needed", body: `A purchase of ${d.amount ?? "?"} needs your approval.`, url: link("/approvals") };
     case "purchase_rejected":

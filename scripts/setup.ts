@@ -45,6 +45,8 @@ async function main() {
   fs.writeFileSync(path, await encryptKeystore(keys, env.AGENT_KEYSTORE_PASSPHRASE));
   fs.writeFileSync("keystore/agents.public.json", JSON.stringify(keys.map(({ privateKey: _p, ...k }) => k), null, 2));
   console.log(`wrote ${path} (${keys.length} agent keys, encrypted) and keystore/agents.public.json`);
+  console.log("Register each public key on its team with POST /v1/agents (founder/admin signs company.register_agent).");
+  console.log("The team contract adds the key itself, limited to request_purchase/record_response/create_bounty.");
   console.log("Heroku: heroku config:set AGENT_KEYSTORE_JSON=\"$(cat keystore/agents.json)\" AGENT_KEYSTORE_PASSPHRASE=...");
 }
 

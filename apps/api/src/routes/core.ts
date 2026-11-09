@@ -1,8 +1,11 @@
 import type { FastifyPluginAsync } from "fastify";
 import { createHash } from "node:crypto";
 import {
+  AgentStatusBody,
+  AllowSellerBody,
   CreateCompanyBody,
   CreatePlanBody,
+  RegisterAgentBody,
   EstimateQuery,
   HireOptionsQuery,
   HttpError,
@@ -11,13 +14,13 @@ import {
   env,
   type UnsignedTx,
 } from "@builderos/shared";
-import { companies, departments, desc, eq, getDb, hires, inArray, plans, sellerOptions, tasks } from "@builderos/db";
-import { companyAccount, companyCreateFunding, tx, views } from "@builderos/near";
+import { agents, and, companies, departments, desc, eq, getDb, hires, inArray, plans, sellerOptions, tasks } from "@builderos/db";
+import { companyAccount, companyCreateFunding, departmentAccount, teamEvmConfig, tx, viewAccount, views, yoctoToNear } from "@builderos/near";
 import { estimate, type Tier } from "@builderos/router";
 import { listHireableAgents, nicheNecessity, HIRE_NECESSITY_MIN, plan as runPlanner, rankHireCandidates, ROLE_FOR_TAG, topoOrder } from "@builderos/orchestrator";
 import { parseChallenges, challengeAmount } from "@builderos/rails";
 import { seal, serialize, serverKey } from "@builderos/crypto";
-import { authorize, requireAccount, requireFounder, visibleCompanies } from "../auth.js";
+import { authorize, departmentScope, requireAccount, requireFounder, visibleCompanies, type Access } from "../auth.js";
 import { parse } from "../app.js";
 
 const DEPT_FOR_TAG: Record<string, string> = { growth: "growth", support: "growth", devops: "ops" };
@@ -34,31 +37,91 @@ export const coreRoutes: FastifyPluginAsync = async (app) => {
 
   app.get<{ Params: { id: string } }>("/companies/:id", async (req) => {
     const account = requireAccount(req);
-    await authorize(account, req.params.id, ["view"]);
+    const access = await authorize(account, req.params.id, ["view", "approve", "builder", "code"]);
     const db = getDb();
     const [c] = await db.select().from(companies).where(eq(companies.id, req.params.id));
-    const depts = await db.select().from(departments).where(eq(departments.companyId, req.params.id));
+    const allowed = departmentScope(access);
+    const depts = (await db.select().from(departments).where(eq(departments.companyId, req.params.id))).filter(
+      (d) => !allowed || allowed.includes(d.id),
+    );
     const onChain = await views.getCompany(req.params.id).catch(() => null); // budget is read from chain
-    return { company: c ?? null, departments: depts, chain: onChain };
+    return { company: c ?? null, departments: depts, chain: onChain, access: accessSummary(access) };
   });
 
-  /** Create a company from a preset → unsigned create_company + department + caps transactions. */
+  /**
+   * Create a company from a preset → unsigned create_company + department + caps transactions.
+   * Reads the chain first so a retry never hits "slug taken": if the caller already owns this slug,
+   * only the missing steps are returned (resume after a partial create). Refuses to hand out a bundle
+   * the wallet can't pay for, so a create can't stop half way for lack of NEAR.
+   */
   app.post("/companies", async (req) => {
-    requireAccount(req);
+    const account = requireAccount(req);
     const body = parse(CreateCompanyBody, req.body);
     const companyId = companyAccount(body.slug);
+    for (const d of body.departments)
+      if (departmentAccount(companyId, d.name).length > 64) throw new HttpError(400, `"${d.name}" + slug is too long for a NEAR account id`, "invalid_request");
+
+    const state = await creationState(body.slug, account);
+    if (state.slugTaken && !state.founderIsYou) throw new HttpError(409, `"${body.slug}" is taken — pick another company name`, "slug_taken");
+    if (state.slugTaken && !state.companyExists)
+      throw new HttpError(409, "This company is still being created on chain. Check again in a few seconds.", "create_in_progress");
+    if (!state.slugTaken && state.companyExists) throw new HttpError(409, `"${body.slug}" is taken — pick another company name`, "slug_taken");
+
     const presetHash = createHash("sha256").update(body.preset).digest("hex");
+    const have = new Set(state.departments.map((d) => d.name));
+    const missingDepts = body.departments.filter((d) => !have.has(d.name));
+    // Each team's Base payment address is derived by Chain Signatures from the team account id,
+    // so it's known before the account exists. Only that team's contract can sign for it.
+    const evm = await Promise.all(missingDepts.map((d) => teamEvmConfig(departmentAccount(companyId, d.name)))).catch(() => {
+      throw new HttpError(503, "Couldn't reach the Chain Signatures contract to derive team payment addresses. Try again.", "mpc_unavailable");
+    });
     const transactions: UnsignedTx[] = [
-      tx.createCompany({ slug: body.slug, name: body.name, preset: body.preset, dailyCap: body.dailyCap, presetHash }),
-      ...body.departments.map((d) => tx.createDepartment(companyId, d)),
-      tx.setCaps(companyId, { dailyCap: body.dailyCap }),
+      ...(state.slugTaken ? [] : [tx.createCompany({ slug: body.slug, name: body.name, preset: body.preset, dailyCap: body.dailyCap, presetHash })]),
+      ...missingDepts.map((d, i) => tx.createDepartment(companyId, { ...d, evm: evm[i] })),
+      ...(state.dailyCap === body.dailyCap ? [] : [tx.setCaps(companyId, { dailyCap: body.dailyCap })]),
     ];
+
+    // Exact cost of what's left to sign: storage deposits + ~0.05 NEAR gas per tx.
+    const deposits = transactions.reduce((sum, t) => sum + BigInt(t.actions[0].params.deposit), 0n);
+    const required = deposits + BigInt(transactions.length) * 50_000_000_000_000_000_000_000n;
+    const bal = await viewAccount(account).catch(() => ({ availableYocto: "0" }));
+    const available = BigInt(bal.availableYocto);
+    if (transactions.length && available < required)
+      throw new HttpError(
+        402,
+        `Add ${nearUp(required - available)} more testnet NEAR first — creating this company needs ~${nearUp(required)} NEAR and the wallet has ${nearUp(available)}. Insufficient balance; nothing was signed.`,
+        "insufficient_funds",
+        { requiredYocto: required.toString(), availableYocto: available.toString(), funding: companyCreateFunding(missingDepts.length) },
+      );
+
     return {
       companyId,
       transactions,
-      /** Exact NEAR deposits the wallet must cover when signing (testnet faucet CTA). */
+      resumed: state.slugTaken,
+      complete: transactions.length === 0,
+      missing: { company: !state.slugTaken, departments: missingDepts.map((d) => d.name), caps: state.dailyCap !== body.dailyCap },
+      /** Poll after signing: confirms the company + teams exist on chain (a failed create is refunded, not "success"). */
+      verify: `/v1/companies/creation/${body.slug}`,
       funding: companyCreateFunding(body.departments.length),
+      requiredYocto: required.toString(),
     };
+  });
+
+  /** On-chain creation status for a slug (no indexer needed). Details only for the founder. */
+  app.get<{ Params: { slug: string } }>("/companies/creation/:slug", async (req) => {
+    const account = requireAccount(req);
+    if (!/^[a-z0-9-]{2,32}$/.test(req.params.slug)) throw new HttpError(400, "invalid slug", "invalid_request");
+    const st = await creationState(req.params.slug, account);
+    if (st.slugTaken && !st.founderIsYou) return { slug: req.params.slug, slugTaken: true, founderIsYou: false };
+    return st;
+  });
+
+  /** Factory couldn't refund a failed create right away → founder signs claim_refund. */
+  app.post("/companies/claim-refund", async (req) => {
+    const account = requireAccount(req);
+    const owed = BigInt(await views.getPendingRefund(account).catch(() => "0"));
+    if (owed === 0n) throw new HttpError(404, "no pending refund", "not_found");
+    return { amountYocto: owed.toString(), amountNear: yoctoToNear(owed), transaction: tx.claimRefund() };
   });
 
   // ---------- planner ----------
@@ -81,8 +144,9 @@ export const coreRoutes: FastifyPluginAsync = async (app) => {
     const account = requireAccount(req);
     const [p] = await getDb().select().from(plans).where(eq(plans.id, req.params.id));
     if (!p) throw new HttpError(404, "plan not found");
-    await authorize(account, p.companyId, ["view"]);
-    const t = await getDb().select().from(tasks).where(eq(tasks.planId, p.id));
+    const access = await authorize(account, p.companyId, ["builder"]);
+    const allowed = departmentScope(access);
+    const t = (await getDb().select().from(tasks).where(eq(tasks.planId, p.id))).filter((x) => !allowed || (x.departmentId && allowed.includes(x.departmentId)));
     const { description: _sealed, ...rest } = p;
     return { plan: rest, tasks: t };
   });
@@ -106,13 +170,13 @@ export const coreRoutes: FastifyPluginAsync = async (app) => {
     const short = p.id.slice(0, 8);
     const idOf = (key: string) => `${short}-${key}`;
     const est = (p.estimate as any).perFeature as Array<{ key: string; p50: string; p90: string; cap: string }>;
-    const transactions: UnsignedTx[] = [];
+    const calls: ReturnType<typeof tx.assignTaskCall>[] = [];
     const rows = order.map((key) => {
       const f = p.features.find((x) => x.key === key)!;
       const e = est.find((x) => x.key === key) ?? estimate(f.tag, f.size, p.tier as Tier);
       const departmentId = deptFor(f.tag);
-      transactions.push(
-        tx.assignTask(departmentId, { taskId: idOf(key), tier: p.tier, cap: e.cap, tag: f.tag, agentRole: ROLE_FOR_TAG[f.tag] ?? "backend", dependsOn: f.dependsOn.map(idOf) }),
+      calls.push(
+        tx.assignTaskCall(departmentId, { taskId: idOf(key), tier: p.tier, cap: e.cap, tag: f.tag, agentRole: ROLE_FOR_TAG[f.tag] ?? "backend", dependsOn: f.dependsOn.map(idOf) }),
       );
       return {
         id: idOf(key),
@@ -136,6 +200,8 @@ export const coreRoutes: FastifyPluginAsync = async (app) => {
       await t.insert(tasks).values(rows).onConflictDoNothing();
       await t.update(plans).set({ approvedAt: new Date() }).where(eq(plans.id, p.id));
     });
+    // assign_task goes through company.dept_call (departments only accept the company as caller).
+    const transactions: UnsignedTx[] = tx.deptCalls(p.companyId, calls);
     return { tasks: rows, transactions };
   });
 
@@ -149,12 +215,15 @@ export const coreRoutes: FastifyPluginAsync = async (app) => {
     const account = requireAccount(req);
     const companyId = req.query.companyId;
     if (!companyId) throw new HttpError(400, "companyId required");
-    await authorize(account, companyId, ["view"]);
-    const rows = await getDb()
-      .select()
-      .from(tasks)
-      .where(req.query.planId ? eq(tasks.planId, req.query.planId) : eq(tasks.companyId, companyId))
-      .orderBy(desc(tasks.createdAt));
+    const access = await authorize(account, companyId, ["builder"]);
+    const allowed = departmentScope(access);
+    const rows = (
+      await getDb()
+        .select()
+        .from(tasks)
+        .where(req.query.planId ? and(eq(tasks.planId, req.query.planId), eq(tasks.companyId, companyId)) : eq(tasks.companyId, companyId))
+        .orderBy(desc(tasks.createdAt))
+    ).filter((x) => !allowed || (x.departmentId && allowed.includes(x.departmentId)));
     return { tasks: rows };
   });
 
@@ -200,13 +269,83 @@ export const coreRoutes: FastifyPluginAsync = async (app) => {
     const account = requireAccount(req);
     const companyId = req.query.companyId;
     if (!companyId) throw new HttpError(400, "companyId required");
-    await authorize(account, companyId, ["view"]);
-    const rows = await getDb()
-      .select()
-      .from(hires)
-      .where(req.query.taskId ? eq(hires.taskId, req.query.taskId) : eq(hires.companyId, companyId))
-      .orderBy(desc(hires.createdAt));
+    const access = await authorize(account, companyId, ["builder"]);
+    const allowed = departmentScope(access);
+    const rows = (
+      await getDb()
+        .select()
+        .from(hires)
+        .where(req.query.taskId ? and(eq(hires.taskId, req.query.taskId), eq(hires.companyId, companyId)) : eq(hires.companyId, companyId))
+        .orderBy(desc(hires.createdAt))
+    ).filter((h) => !allowed || allowed.includes(h.departmentId));
     return { hires: rows };
+  });
+
+  // ---------- agents (keys are added/removed by the team contract, never by a person's key) ----------
+
+  /** Founder/admin: register an agent key on a team → company.register_agent (team adds a limited key). */
+  app.post("/agents", async (req) => {
+    const account = requireAccount(req);
+    const body = parse(RegisterAgentBody, req.body);
+    if (!body.departmentId.endsWith(`.${body.companyId}`)) throw new HttpError(400, "departmentId is not a team of companyId", "invalid_request");
+    await authorize(account, body.companyId, ["admin"]);
+    return { transaction: tx.registerAgent(body.departmentId, body.publicKey, body.role) };
+  });
+
+  /** Founder/admin: pause/resume (off-chain, the orchestrator stops giving it tasks) or fire (on-chain key delete). */
+  app.post<{ Params: { agentId: string } }>("/agents/:agentId/status", async (req) => {
+    const account = requireAccount(req);
+    const body = parse(AgentStatusBody, req.body);
+    const [a] = await getDb().select().from(agents).where(eq(agents.publicKey, req.params.agentId));
+    if (!a || !a.departmentId.endsWith(`.${body.companyId}`)) throw new HttpError(404, "agent not found", "not_found");
+    await authorize(account, body.companyId, ["admin"]);
+    if (body.status === "fired") return { transaction: tx.fireAgent(a.departmentId, a.publicKey) };
+    await getDb().update(agents).set({ status: body.status === "paused" ? "paused" : "active" }).where(eq(agents.publicKey, a.publicKey));
+    return { ok: true, status: body.status };
+  });
+
+  // ---------- payments: team addresses + seller allow-list ----------
+
+  /** Where each team's USDC lives on Base (Chain Signatures address) — fund these to let agents pay. */
+  app.get<{ Params: { id: string } }>("/companies/:id/payments", async (req) => {
+    const account = requireAccount(req);
+    const access = await authorize(account, req.params.id, ["view", "approve"]);
+    const allowed = departmentScope(access);
+    const teams = (await views.getDepartments(req.params.id).catch(() => [])).filter((d) => !allowed || allowed.includes(d.department_id));
+    const out = await Promise.all(
+      teams.map(async (d) => {
+        const [onChain, derived] = await Promise.all([views.getDepartment(d.department_id).catch(() => null), teamEvmConfig(d.department_id).catch(() => null)]);
+        return {
+          name: d.name,
+          departmentId: d.department_id,
+          chainId: onChain?.evm_chain_id || derived?.chain_id || null,
+          usdc: onChain?.evm_usdc ?? derived?.usdc ?? null,
+          address: onChain?.base_address ?? null,
+          derivedAddress: derived?.from ?? null,
+          configured: Boolean(onChain?.base_address && derived && onChain.base_address.toLowerCase() === derived.from.toLowerCase()),
+        };
+      }),
+    );
+    return { teams: out };
+  });
+
+  /** Founder/admin: (re)set each team's payment config to its Chain Signatures address (for teams created before it existed). */
+  app.post<{ Params: { id: string } }>("/companies/:id/payments/configure", async (req) => {
+    const account = requireAccount(req);
+    await authorize(account, req.params.id, ["admin"]);
+    const teams = await views.getDepartments(req.params.id).catch(() => []);
+    if (!teams.length) throw new HttpError(409, "company has no teams on chain yet", "no_teams");
+    const transactions = await Promise.all(teams.map(async (d) => tx.setEvmConfig(d.department_id, await teamEvmConfig(d.department_id))));
+    return { transactions };
+  });
+
+  /** Founder/admin: allow-list a seller for a team at one payee address (or remove it with payTo: null). */
+  app.post("/sellers/allow", async (req) => {
+    const account = requireAccount(req);
+    const body = parse(AllowSellerBody, req.body);
+    if (!body.departmentId.endsWith(`.${body.companyId}`)) throw new HttpError(400, "departmentId is not a team of companyId", "invalid_request");
+    await authorize(account, body.companyId, ["admin"]);
+    return { transaction: tx.allowSeller(body.departmentId, body.sellerId, body.payTo) };
   });
 
   /** Up to 3 sellers for one service with live 402 price and a quality note from the registry. */
@@ -250,3 +389,59 @@ export const coreRoutes: FastifyPluginAsync = async (app) => {
 
   void requireFounder;
 };
+
+/** What the dashboard may show this account (the founder decides via grants). */
+export function accessSummary(a: Access) {
+  return {
+    founder: a.founder,
+    admin: a.admin,
+    scopes: [...a.scopes],
+    departmentId: a.departmentId,
+    expiresAtMs: a.grant?.expires_at_ms ?? null,
+  };
+}
+
+type CreationState = {
+  slug: string;
+  companyId: string;
+  slugTaken: boolean;
+  founderIsYou: boolean;
+  companyExists: boolean;
+  departments: Array<{ name: string; departmentId: string }>;
+  dailyCap: string | null;
+  pendingRefundYocto: string;
+};
+
+/** Everything about a create, read from chain: factory slug record, company account, its departments, refunds. */
+async function creationState(slug: string, account: string): Promise<CreationState> {
+  const companyId = companyAccount(slug);
+  const [meta, acct, pending] = await Promise.all([
+    views.getFactoryCompany(slug).catch(() => null),
+    viewAccount(companyId).catch(() => ({ exists: false })),
+    views.getPendingRefund(account).catch(() => "0"),
+  ]);
+  const companyExists = Boolean((acct as any).exists);
+  let depts: Array<{ name: string; departmentId: string }> = [];
+  let dailyCap: string | null = null;
+  if (companyExists) {
+    const [list, company] = await Promise.all([views.getDepartments(companyId).catch(() => []), views.getCompany(companyId).catch(() => null)]);
+    depts = (list ?? []).map((d) => ({ name: d.name, departmentId: d.department_id }));
+    dailyCap = company?.daily_cap ?? null;
+  }
+  return {
+    slug,
+    companyId,
+    slugTaken: Boolean(meta),
+    founderIsYou: meta?.founder === account,
+    companyExists,
+    departments: depts,
+    dailyCap,
+    pendingRefundYocto: pending ?? "0",
+  };
+}
+
+/** Yocto → NEAR rounded up to 2 decimals, for messages. */
+function nearUp(yocto: bigint): string {
+  const cents = (yocto + 10n ** 22n - 1n) / 10n ** 22n;
+  return `${cents / 100n}.${(cents % 100n).toString().padStart(2, "0")}`;
+}

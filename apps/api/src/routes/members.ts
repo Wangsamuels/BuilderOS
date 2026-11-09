@@ -42,7 +42,7 @@ export const memberRoutes: FastifyPluginAsync = async (app) => {
       .returning({ id: invites.id });
     return {
       inviteId: row.id,
-      transaction: tx.invite(body.companyId, { inviteHash: codeHash, departments: body.departments, scopes: SCOPES[body.template], limit: body.limit ?? null, expiresAtMs: expiresAt.getTime() }),
+      transaction: tx.invite(body.companyId, { inviteHash: codeHash, departments: body.departments.map((d) => (d.includes(".") ? d.split(".")[0] : d)), scopes: SCOPES[body.template], limit: body.limit ?? null, expiresAtMs: expiresAt.getTime() }),
     };
   });
 
@@ -66,11 +66,15 @@ export const memberRoutes: FastifyPluginAsync = async (app) => {
 
   app.get<{ Querystring: { companyId: string } }>("/members", async (req) => {
     const account = requireAccount(req);
-    await authorize(account, req.query.companyId, ["view"]);
+    const access = await authorize(account, req.query.companyId, ["view", "approve", "builder", "code"]);
     const { sql } = await import("@builderos/db");
-    const r = await getDb().execute(sql`select account_id, department_id, scopes, "limit", expires_at, revoked, (view_key is not null) as has_view_key
-      from members_cache where company_id = ${req.query.companyId} order by account_id`);
-    return { members: r.rows };
+    // Only the founder (or an admin the founder appointed) sees who else is in the company.
+    const r = access.admin
+      ? await getDb().execute(sql`select account_id, department_id, scopes, "limit", expires_at, revoked, (view_key is not null) as has_view_key
+          from members_cache where company_id = ${req.query.companyId} order by account_id`)
+      : await getDb().execute(sql`select account_id, department_id, scopes, "limit", expires_at, revoked, (view_key is not null) as has_view_key
+          from members_cache where company_id = ${req.query.companyId} and account_id = ${account}`);
+    return { members: r.rows, canManage: access.founder };
   });
 
   // ---------- keys ----------

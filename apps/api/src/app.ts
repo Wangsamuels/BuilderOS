@@ -89,7 +89,8 @@ export async function buildApp(opts: { log: Logger; hub?: SseHub }): Promise<Fas
   });
 
   app.setErrorHandler((err: any, req, reply) => {
-    if (err instanceof HttpError) return reply.code(err.status).send({ error: err.code, message: err.message });
+    if (err instanceof HttpError)
+      return reply.code(err.status).send({ error: err.code, code: err.code, message: err.message, ...(err.details ? { details: err.details } : {}) });
     if (err.statusCode && err.statusCode < 500) return reply.code(err.statusCode).send({ error: err.code ?? "error", message: err.message });
     req.log.error({ err: err.message, stack: err.stack }, "unhandled");
     return reply.code(500).send({ error: "internal", message: "Internal error" });

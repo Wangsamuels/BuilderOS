@@ -23,6 +23,26 @@ async function main() {
   async function onEvent(e: IndexedEvent) {
     const d = e.data;
     switch (e.event) {
+      case "company_create_failed":
+      case "refund_pending":
+        // Tell the founder in-app; a pending refund is pulled with POST /v1/companies/claim-refund.
+        await boss.send(
+          QUEUES.notify,
+          {
+            alert: {
+              kind: "info",
+              companyId: null,
+              to: [d.founder],
+              title: e.event === "refund_pending" ? "Refund ready to claim" : "Company creation failed",
+              body:
+                e.event === "refund_pending"
+                  ? "Your create-company deposit is waiting. Open BuilderOS and claim it."
+                  : `"${d.slug}" could not be created. Your deposit is refunded and the name is free again.`,
+            } satisfies Alert,
+          },
+          retry,
+        );
+        break;
       case "task_assigned":
         await getDb().update(tasks).set({ status: "assigned", updatedAt: new Date() }).where(eq(tasks.id, d.task_id));
         break;

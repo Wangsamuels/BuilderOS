@@ -78,20 +78,48 @@ export function requireAccount(req: FastifyRequest): string {
 export type Scope = "view" | "approve" | "code" | "builder" | "admin";
 
 /**
- * Re-check on chain before building any transaction: founder, or a live grant with the scope.
- * `target` is the company or department contract the grant lives on.
+ * What one account may see/do in one company. The founder decides this: every non-founder right comes
+ * from a grant the founder created on chain (invite → accept_invite), read live from the company
+ * contract — never from the Postgres cache.
  */
-export async function authorize(account: string, companyId: string, scopes: Scope[], target?: string): Promise<{ founder: boolean; grant: Grant | null }> {
-  if (await isFounder(companyId, account)) return { founder: true, grant: null };
-  const grant = await views.getGrant(target ?? companyId, account).catch(() => null);
-  const ok =
-    grant &&
-    !grant.revoked &&
-    (!grant.expires_at_ms || grant.expires_at_ms > Date.now()) &&
-    grant.scopes.some((s) => s === "admin" || scopes.includes(s as Scope));
-  if (!ok) throw new HttpError(403, "no grant for this action", "forbidden");
-  return { founder: false, grant };
+export type Access = {
+  founder: boolean;
+  /** Founder, or a grant with the "admin" scope (founder-approved). */
+  admin: boolean;
+  grant: Grant | null;
+  scopes: Set<string>;
+  /** Department the grant is limited to; null = whole company (founder / admin / company-wide grant). */
+  departmentId: string | null;
+};
+
+const ALL: Scope[] = ["view", "approve", "code", "builder", "admin"];
+
+export async function accessFor(account: string, companyId: string): Promise<Access | null> {
+  if (await isFounder(companyId, account)) return { founder: true, admin: true, grant: null, scopes: new Set(ALL), departmentId: null };
+  // Grants live on the company contract (departments have no grant table).
+  const grant = await views.getGrant(companyId, account).catch(() => null);
+  if (!grant || grant.revoked || (grant.expires_at_ms && grant.expires_at_ms < Date.now())) return null;
+  const admin = grant.scopes.includes("admin");
+  const companyWide = !grant.department_id || grant.department_id === companyId;
+  return { founder: false, admin, grant, scopes: new Set(grant.scopes), departmentId: admin || companyWide ? null : grant.department_id };
 }
+
+/**
+ * Re-check on chain before reading company data or building any transaction: founder, admin, or a live
+ * grant with one of `scopes`. When `departmentId` is given, a department-limited grant must match it.
+ */
+export async function authorize(account: string, companyId: string, scopes: Scope[], departmentId?: string | null): Promise<Access> {
+  const access = await accessFor(account, companyId);
+  const ok =
+    access &&
+    (access.admin ||
+      (scopes.some((s) => access.scopes.has(s)) && (!departmentId || access.departmentId === null || access.departmentId === departmentId)));
+  if (!ok) throw new HttpError(403, "no grant for this action", "forbidden");
+  return access;
+}
+
+/** Departments this access may read; null means all of them. */
+export const departmentScope = (a: Access): string[] | null => (a.departmentId ? [a.departmentId] : null);
 
 export async function requireFounder(account: string, companyId: string) {
   if (!(await isFounder(companyId, account))) throw new HttpError(403, "founder only", "forbidden");

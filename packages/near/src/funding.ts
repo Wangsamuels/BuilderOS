@@ -2,11 +2,11 @@ import { env, network } from "@builderos/shared";
 
 /**
  * Storage deposits attached on create txs (must cover wasm storage on NEAR).
- * company.wasm ≈ 600KB → ~6.15 NEAR; department.wasm ≈ 300KB → ~3.07 NEAR.
- * Contract mins: create_company ≥ 7 NEAR, create_department ≥ 4 NEAR.
+ * company.wasm ≈ 670KB → ~6.7 NEAR; department.wasm ≈ 340KB → ~3.4 NEAR (+ agent gas).
+ * Contract mins: create_company ≥ 7.5 NEAR, create_department ≥ 4.5 NEAR.
  */
-export const CREATE_COMPANY_DEPOSIT_YOCTO = 7_000_000_000_000_000_000_000_000n; // 7 NEAR
-export const CREATE_DEPARTMENT_DEPOSIT_YOCTO = 4_000_000_000_000_000_000_000_000n; // 4 NEAR
+export const CREATE_COMPANY_DEPOSIT_YOCTO = 7_500_000_000_000_000_000_000_000n; // 7.5 NEAR
+export const CREATE_DEPARTMENT_DEPOSIT_YOCTO = 4_500_000_000_000_000_000_000_000n; // 4.5 NEAR
 /** Extra headroom for gas after create (not attached as deposit). */
 export const CREATE_COMPANY_GAS_BUFFER_YOCTO = 1_000_000_000_000_000_000_000_000n; // 1 NEAR
 
@@ -28,7 +28,7 @@ export function nearToYocto(near: string): bigint {
 
 /**
  * NEAR the founder must cover to sign the default company create bundle.
- * Default 3 teams → 7 + 4×3 + 1 = 20 NEAR recommended.
+ * Default 3 teams → 7.5 + 4.5×3 + 1 = 22 NEAR recommended.
  */
 export function companyCreateFunding(departmentCount = 3) {
   const depts = BigInt(Math.max(0, departmentCount));
@@ -36,7 +36,10 @@ export function companyCreateFunding(departmentCount = 3) {
   const recommended = deposits + CREATE_COMPANY_GAS_BUFFER_YOCTO;
   const n = network();
   const e = env();
-  const autoFundAvailable = n.id === "testnet" && Boolean(e.TESTNET_SPONSOR_ACCOUNT_ID && e.TESTNET_SPONSOR_PRIVATE_KEY);
+  const sponsor = e.TESTNET_SPONSOR_ACCOUNT_ID;
+  // The factory/registry/worker/verifier balances back storage and refunds — never drip from them.
+  const sponsorSafe = Boolean(sponsor) && ![n.factory, n.registry, e.WORKER_ACCOUNT_ID, e.VERIFIER_ACCOUNT_ID].includes(sponsor);
+  const autoFundAvailable = n.id === "testnet" && sponsorSafe && Boolean(e.TESTNET_SPONSOR_PRIVATE_KEY);
   return {
     network: n.id,
     currency: "NEAR",
@@ -63,7 +66,7 @@ export function companyCreateFunding(departmentCount = 3) {
     hint: autoFundAvailable
       ? `Testnet will auto-fund ~${yoctoToNear(recommended)} NEAR so you can create a company without a faucet wall.`
       : n.id === "testnet"
-        ? `Need ~${yoctoToNear(recommended)} testnet NEAR to create a company (7 NEAR company wasm + 4 NEAR × ${depts} teams + gas).`
+        ? `Need ~${yoctoToNear(recommended)} testnet NEAR to create a company (${yoctoToNear(CREATE_COMPANY_DEPOSIT_YOCTO)} NEAR company + ${yoctoToNear(CREATE_DEPARTMENT_DEPOSIT_YOCTO)} NEAR × ${depts} teams + gas).`
         : `Fund about ${yoctoToNear(recommended)} NEAR before creating a company.`,
   };
 }

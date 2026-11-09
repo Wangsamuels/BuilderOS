@@ -5,3 +5,4 @@ export * from "./contracts.js";
 export * from "./funding.js";
 export * from "./signer.js";
 export * from "./events.js";
+export * from "./payments.js";

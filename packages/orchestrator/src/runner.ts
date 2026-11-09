@@ -4,7 +4,7 @@ import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { env, type Logger } from "@builderos/shared";
-import { and, approvalCards, encryptedLogs, eq, getDb, provenance, sql, tasks } from "@builderos/db";
+import { agents, and, approvalCards, encryptedLogs, eq, getDb, provenance, sql, tasks } from "@builderos/db";
 import { createBuilderFetch, PurchasePending, PurchaseRejected } from "@builderos/fetch";
 import { complete, MODELS, type Tier } from "@builderos/router";
 import { seal, serialize, serverKey, sha256Hex } from "@builderos/crypto";
@@ -71,9 +71,17 @@ export async function runTask(taskId: string, log: Logger) {
   const role = ROLE_FOR_TAG[t.tag] ?? "backend";
   const agent = await agentFor(t.departmentId, role);
   if (!agent) throw new Error(`no agent key for ${t.departmentId}/${role}`);
+  // Founder/admin can pause or fire an agent; a paused/fired agent gets no work.
+  const [row] = await db.select({ status: agents.status }).from(agents).where(eq(agents.publicKey, agent.publicKey));
+  if (row && row.status !== "active") {
+    await db.update(tasks).set({ status: "paused", pauseReason: `agent_${row.status}`, updatedAt: new Date() }).where(eq(tasks.id, taskId));
+    return { status: "paused" };
+  }
 
   await db.update(tasks).set({ status: "running", agent: agent.accountId, attempts: sql`${tasks.attempts} + 1`, updatedAt: new Date() }).where(eq(tasks.id, taskId));
-  const bfetch = createBuilderFetch({ agent: { accountId: agent.accountId, privateKey: agent.privateKey } });
+  const resumeRequestId = t.pauseReason?.startsWith("approved:") ? t.pauseReason.slice("approved:".length) : undefined;
+  const bfetch = createBuilderFetch({ agent: { accountId: agent.accountId, privateKey: agent.privateKey }, resumeRequestId });
+  if (resumeRequestId) await db.update(tasks).set({ pauseReason: null }).where(eq(tasks.id, taskId));
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), `task-${taskId}-`));
   const transcript: string[] = [];
 

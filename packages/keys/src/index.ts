@@ -9,6 +9,12 @@ import { isFounder, views, type Grant } from "@builderos/near";
 
 export type KeyKind = "code" | "log";
 
+function teamGrant(g: Grant | null, companyId: string, departmentId?: string | null): Grant | null {
+  if (!g || !departmentId) return g;
+  const companyWide = !g.department_id || g.department_id === companyId || g.scopes.includes("admin");
+  return companyWide || g.department_id === departmentId ? g : null;
+}
+
 function grantAllows(g: Grant | null, kind: KeyKind) {
   if (!g) return "no grant";
   if (g.revoked) return "revoked";
@@ -33,7 +39,8 @@ export async function uploadWrapped(p: {
 }) {
   if (!(await isFounder(p.companyId, p.caller))) {
     if (p.kind === "code") throw new HttpError(403, "only the founder can upload code keys");
-    const g = await views.getGrant(p.departmentId ?? p.companyId, p.caller).catch(() => null);
+    // Grants live on the company contract; a team-limited grant only covers its own team.
+    const g = teamGrant(await views.getGrant(p.companyId, p.caller).catch(() => null), p.companyId, p.departmentId);
     if (grantAllows(g, "code")) throw new HttpError(403, "not allowed");
   }
   if (p.kind === "code") {
@@ -57,7 +64,8 @@ export async function uploadWrapped(p: {
 export async function releaseWrapped(p: { caller: string; companyId: string; kind: KeyKind; departmentId?: string | null; version?: number }) {
   const founder = await isFounder(p.companyId, p.caller);
   if (!founder) {
-    const g = await views.getGrant(p.departmentId ?? p.companyId, p.caller).catch(() => null);
+    // Grants live on the company contract; a team-limited grant only covers its own team.
+    const g = teamGrant(await views.getGrant(p.companyId, p.caller).catch(() => null), p.companyId, p.departmentId);
     const deny = grantAllows(g, p.kind);
     if (deny) {
       await logAccess(p.caller, p.companyId, p.kind, false, deny);

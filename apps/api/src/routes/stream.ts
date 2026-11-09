@@ -3,7 +3,22 @@ import { HttpError } from "@builderos/shared";
 import { getDb, sql } from "@builderos/db";
 import { finalBlock } from "@builderos/near";
 import { originAllowed } from "../app.js";
-import { requireAccount, visibleCompanies } from "../auth.js";
+import { accessFor, requireAccount, visibleCompanies, type Access } from "../auth.js";
+import type { StreamFilter } from "../sse.js";
+
+// Upgrade proposals are shown to every member: code can only change after a public 24h wait.
+const EVERYONE = ["company_created", "department_created", "frozen", "unfrozen", "upgrade_proposed", "upgrade_cancelled", "upgrade_applied"];
+const MONEY = ["payment_signed", "receipt", "purchase_requested", "purchase_yielded", "purchase_approved", "purchase_rejected", "topup_requested", "topup_recorded", "withdrawal_requested", "withdrawal_recorded", "float_set", "deposit", "revenue", "bounty_released", "bounty_voided"];
+const BUILD = ["task_assigned", "agent_registered", "bounty_created", "agent_hired", "bounty_released", "bounty_voided"];
+
+/** Founder/admin see every event; members see only the event kinds their scopes cover, for their team. */
+export function streamFilter(a: Access): StreamFilter {
+  if (a.admin) return { departments: null, events: null };
+  const events = new Set(EVERYONE);
+  if (a.scopes.has("view") || a.scopes.has("approve")) MONEY.forEach((e) => events.add(e));
+  if (a.scopes.has("builder")) BUILD.forEach((e) => events.add(e));
+  return { departments: a.departmentId ? [a.departmentId] : null, events };
+}
 
 export const streamRoutes: FastifyPluginAsync = async (app) => {
   /**
@@ -18,6 +33,13 @@ export const streamRoutes: FastifyPluginAsync = async (app) => {
       if (!companies.includes(req.query.companyId)) throw new HttpError(403, "not a member of this company");
       companies = [req.query.companyId];
     }
+    // Each company's events are filtered by what the founder granted this account (read live from chain).
+    const filters = new Map<string, StreamFilter>();
+    for (const c of companies) {
+      const access = await accessFor(account, c).catch(() => null);
+      if (access) filters.set(c, streamFilter(access));
+    }
+    if (req.query.companyId && !filters.size) throw new HttpError(403, "no grant for this company", "forbidden");
     const last = Number(req.headers["last-event-id"] ?? req.query.lastEventId ?? 0) || undefined;
 
     const origin = req.headers.origin;
@@ -33,7 +55,7 @@ export const streamRoutes: FastifyPluginAsync = async (app) => {
 
     const lag = await indexerLag().catch(() => null);
     if (lag != null && lag > 30) reply.raw.write(`event: status\ndata: ${JSON.stringify({ catchingUp: true, lag })}\n\n`);
-    await app.hub.add(account, companies, reply, last);
+    await app.hub.add(account, filters, reply, last);
   });
 
   /** Small status panel: indexer lag, queue depth, failed jobs, bridge transfers in flight, Tempo/MPP rails. */

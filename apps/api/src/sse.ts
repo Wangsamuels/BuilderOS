@@ -3,7 +3,17 @@ import type { FastifyReply } from "fastify";
 import { EVENTS_CHANNEL, getDb, pgConfig, sql } from "@builderos/db";
 import type { Logger } from "@builderos/shared";
 
-type Client = { id: number; account: string; companies: Set<string>; reply: FastifyReply };
+/** Per-company visibility for one connection: null = everything (founder/admin). */
+export type StreamFilter = { departments: string[] | null; events: Set<string> | null };
+type Client = { id: number; account: string; companies: Map<string, StreamFilter>; reply: FastifyReply };
+
+export function visible(f: StreamFilter | undefined, ev: { event: string; department_id: string | null }) {
+  if (!f) return false;
+  if (f.events && !f.events.has(ev.event)) return false;
+  // Company-level events (no department) pass; team events must be in the member's team.
+  if (f.departments && ev.department_id && !f.departments.includes(ev.department_id)) return false;
+  return true;
+}
 
 /**
  * SSE fan-out. One dedicated Postgres connection LISTENs for event ids from the indexer;
@@ -54,20 +64,21 @@ export class SseHub {
     const r = await getDb().execute<any>(sql`select id, event, company_id, department_id, data, near_tx, block_height, created_at from events where id = ${id}`);
     const ev = r.rows[0];
     if (!ev) return;
-    for (const c of this.clients.values()) if (ev.company_id && c.companies.has(ev.company_id)) write(c.reply, ev);
+    for (const c of this.clients.values()) if (ev.company_id && visible(c.companies.get(ev.company_id), ev)) write(c.reply, ev);
   }
 
   /** Register a client and replay anything after lastEventId (resumable stream). */
-  async add(account: string, companies: string[], reply: FastifyReply, lastEventId?: number) {
+  async add(account: string, filters: Map<string, StreamFilter>, reply: FastifyReply, lastEventId?: number) {
     const id = ++this.seq;
-    const client: Client = { id, account, companies: new Set(companies), reply };
+    const client: Client = { id, account, companies: filters, reply };
+    const companies = [...filters.keys()];
     reply.raw.on("close", () => this.clients.delete(id));
     if (lastEventId && companies.length) {
       const r = await getDb().execute<any>(
         sql`select id, event, company_id, department_id, data, near_tx, block_height, created_at from events
             where id > ${lastEventId} and company_id = any(${companies}) order by id limit 500`,
       );
-      for (const ev of r.rows) write(reply, ev);
+      for (const ev of r.rows) if (visible(filters.get(ev.company_id), ev)) write(reply, ev);
     }
     this.clients.set(id, client);
     return id;

@@ -167,7 +167,9 @@ export async function complete(
       deps.log.warn({ model: c.model.id, err: e?.message }, "model call failed, trying next in tier");
       await db.insert(modelCalls).values({ taskId: p.taskId, model: c.model.id, provider: c.offer.sellerId, rail: c.offer.rail, tier: p.tier, latencyMs: Date.now() - started, outcome: "error" });
       // Purchase pending/rejected are not model failures; surface them.
-      if (e?.name === "PurchasePending" || e?.constructor?.name === "PurchasePending" || e?.constructor?.name === "PurchaseRejected") throw e;
+      // A rail the team contract can't sign for (e.g. Tempo MPP) or a payee it blocked: try the next offer in the tier.
+      const fallThrough = ["rail_not_supported", "payee_mismatch"].includes(e?.reason);
+      if (!fallThrough && (e?.name === "PurchasePending" || e?.constructor?.name === "PurchasePending" || e?.constructor?.name === "PurchaseRejected")) throw e;
     }
   }
   throw lastErr;

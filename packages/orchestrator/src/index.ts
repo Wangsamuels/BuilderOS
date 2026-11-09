@@ -29,7 +29,8 @@ export async function markQueued(id: string) {
 /** Resume tasks parked on a purchase once its approval lands. */
 export async function resumeForRequest(requestId: string, log: Logger) {
   const r = await getDb().execute<{ id: string }>(
-    sql`update tasks set status = 'ready', pause_reason = null, updated_at = now() where status = 'paused' and pause_reason = ${`purchase:${requestId}`} returning id`,
+    // Keep the request id so the re-run reuses the approved request instead of asking for approval again.
+    sql`update tasks set status = 'ready', pause_reason = ${`approved:${requestId}`}, updated_at = now() where status = 'paused' and pause_reason = ${`purchase:${requestId}`} returning id`,
   );
   if (r.rows.length) log.info({ requestId, tasks: r.rows.map((x) => x.id) }, "resumed tasks after approval");
 }

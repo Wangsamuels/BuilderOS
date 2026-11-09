@@ -49,7 +49,8 @@ export async function runIndexer(opts: IndexerOptions, signal?: AbortSignal) {
   const { log } = opts;
   const db = getDb();
   let last = await lastHeight(db);
-  log.info({ from: last }, "indexer starting");
+  const batch = opts.batch ?? Number(process.env.INDEXER_BATCH ?? 40);
+  log.info({ from: last, batch }, "indexer starting");
 
   while (!signal?.aborted) {
     try {
@@ -58,10 +59,13 @@ export async function runIndexer(opts: IndexerOptions, signal?: AbortSignal) {
         await sleep(opts.idleMs ?? 1000);
         continue;
       }
-      const to = Math.min(head, last + (opts.batch ?? 10));
-      for (let h = last + 1; h <= to; h++) {
-        await processBlock(h, opts);
-        last = h;
+      const to = Math.min(head, last + batch);
+      const heights = Array.from({ length: to - last }, (_, i) => last + 1 + i);
+      // Fetch (RPC-bound) in parallel, then write strictly in block order so replay stays deterministic.
+      const fetched = await mapLimit(heights, Number(process.env.INDEXER_CONCURRENCY ?? 8), fetchBlockTxs);
+      for (let i = 0; i < heights.length; i++) {
+        for (const t of fetched[i]) await processTx(t.hash, t.signer, heights[i], t.status, opts);
+        last = heights[i];
       }
       await db
         .insert(indexerState)
@@ -75,6 +79,20 @@ export async function runIndexer(opts: IndexerOptions, signal?: AbortSignal) {
   }
 }
 
+async function mapLimit<T, R>(items: T[], limit: number, fn: (t: T) => Promise<R>): Promise<R[]> {
+  const out = new Array<R>(items.length);
+  let next = 0;
+  await Promise.all(
+    Array.from({ length: Math.min(limit, items.length) }, async () => {
+      while (next < items.length) {
+        const i = next++;
+        out[i] = await fn(items[i]);
+      }
+    }),
+  );
+  return out;
+}
+
 async function lastHeight(db: DB) {
   const [row] = await db.select().from(indexerState).where(sql`${indexerState.id} = 'near'`);
   if (row) return row.lastBlockHeight;
@@ -83,23 +101,25 @@ async function lastHeight(db: DB) {
   return ((await finalBlock()).header.height as number) - 1;
 }
 
-export async function processBlock(height: number, opts: IndexerOptions) {
+type BlockTx = { hash: string; signer: string; status: any };
+
+/** Transactions in this block that touch BuilderOS accounts, with their final outcomes. */
+export async function fetchBlockTxs(height: number): Promise<BlockTx[]> {
   let block: any;
   try {
     block = await blockAt(height);
   } catch (e: any) {
-    if (String(e?.message).includes("UNKNOWN_BLOCK")) return; // skipped height
+    if (String(e?.message).includes("UNKNOWN_BLOCK")) return []; // skipped height
     throw e;
   }
-  for (const c of block.chunks as any[]) {
-    if (c.height_included !== height) continue;
-    const ch = await chunk(c.chunk_hash);
-    const ours = (ch.transactions as any[]).filter((t) => isOurs(t.receiver_id) || isOurs(t.signer_id));
-    for (const t of ours) {
-      const status = await txStatus(t.hash, t.signer_id);
-      await processTx(t.hash, t.signer_id, height, status, opts);
-    }
-  }
+  const chunks = (block.chunks as any[]).filter((c) => c.height_included === height && c.tx_root !== "11111111111111111111111111111111");
+  const lists = await Promise.all(chunks.map((c) => chunk(c.chunk_hash)));
+  const ours = lists.flatMap((ch) => (ch.transactions as any[]).filter((t) => isOurs(t.receiver_id) || isOurs(t.signer_id)));
+  return Promise.all(ours.map(async (t) => ({ hash: t.hash as string, signer: t.signer_id as string, status: await txStatus(t.hash, t.signer_id) })));
+}
+
+export async function processBlock(height: number, opts: IndexerOptions) {
+  for (const t of await fetchBlockTxs(height)) await processTx(t.hash, t.signer, height, t.status, opts);
 }
 
 /** Parse all logs of one transaction and persist. Idempotent on (receipt_id, log_index). */
@@ -190,6 +210,9 @@ async function applyToCaches(db: DB, event: EventName, d: Record<string, any>, c
         .insert(agents)
         .values({ publicKey: d.public_key, accountId: d.account_id ?? null, departmentId: d.department_id, role: d.role, maxTier: d.max_tier, ...chain })
         .onConflictDoUpdate({ target: agents.publicKey, set: { role: d.role, maxTier: d.max_tier, status: "active" } });
+      break;
+    case "agent_fired":
+      await db.execute(sql`update agents set status = 'fired' where public_key = ${d.public_key}`);
       break;
     case "grant_set":
       await db
@@ -305,7 +328,7 @@ async function applyToCaches(db: DB, event: EventName, d: Record<string, any>, c
       } else {
         await db.insert(approvalCards).values({
           companyId: c.companyId,
-          kind: d.reason === "seller_choice" ? "seller" : "single",
+          kind: d.reason === "seller_choice" || d.reason === "new_seller" ? "seller" : "single",
           requestIds: [d.request_id],
           amount: d.amount ?? null,
           payload: d,

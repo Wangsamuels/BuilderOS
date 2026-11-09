@@ -11,6 +11,7 @@ use near_sdk::{
 #[borsh(crate = "near_sdk::borsh")]
 enum Keys {
     Companies,
+    PendingRefunds,
 }
 
 const EVENT_STANDARD: &str = "builderos";
@@ -28,8 +29,8 @@ fn emit(event: &str, data: near_sdk::serde_json::Value) {
 
 const COMPANY_WASM: &[u8] = include_bytes!("../../wasm/company.wasm");
 
-/// company.wasm ≈ 600KB × 10^19 yocto/byte ≈ 6.15 NEAR; keep margin for account + init state.
-const MIN_CREATE_DEPOSIT: NearToken = NearToken::from_near(7);
+/// company.wasm ≈ 670KB × 10^19 yocto/byte ≈ 6.7 NEAR; keep margin for account + state growth.
+const MIN_CREATE_DEPOSIT: NearToken = NearToken::from_millinear(7_500);
 
 #[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Clone, Debug)]
 #[serde(crate = "near_sdk::serde")]
@@ -93,7 +94,7 @@ impl Contract {
         );
         require!(!self.companies.contains_key(&slug), "slug taken");
         let deposit = env::attached_deposit();
-        require!(deposit >= MIN_CREATE_DEPOSIT, "attach >= 7 NEAR (company wasm storage)");
+        require!(deposit >= MIN_CREATE_DEPOSIT, "attach >= 7.5 NEAR (company wasm storage)");
 
         let founder = env::predecessor_account_id();
         let company_id: AccountId = format!("{}.{}", slug, env::current_account_id())
@@ -124,7 +125,8 @@ impl Contract {
         Promise::new(company_id.clone())
             .create_account()
             .transfer(deposit)
-            .add_full_access_key(env::signer_account_pk())
+            // No full-access key for anyone: the company's own code (and its upgrade timelock) is
+            // the only way to act for this account, so no single key can bypass the spending rules.
             .deploy_contract(COMPANY_WASM.to_vec())
             .function_call(
                 "new".to_string(),
@@ -164,10 +166,19 @@ impl Contract {
                     "refund_yocto": deposit.as_yoctonear().to_string(),
                 }),
             );
-            // Bounced sub-account transfer lands on the factory — refund the signer.
+            // The bounced deposit comes back to the factory as a separate refund receipt, which may
+            // land after this callback. Only pay out now if the factory can cover it from free
+            // balance; otherwise record it so the founder can `claim_refund` once it has arrived.
             // Must not panic: panic rolls back slug removal (caused "slug taken" after storage fails).
             if deposit.as_yoctonear() > 0 {
-                return Some(Promise::new(founder).transfer(deposit));
+                if Self::free_balance() >= deposit.as_yoctonear() {
+                    return Some(Promise::new(founder).transfer(deposit));
+                }
+                let mut pending = Self::pending_refunds();
+                let owed = pending.get(&founder).copied().unwrap_or(0) + deposit.as_yoctonear();
+                pending.insert(founder.clone(), owed);
+                pending.flush();
+                emit("refund_pending", json!({ "founder": founder, "amount_yocto": owed.to_string() }));
             }
             return None;
         }
@@ -182,6 +193,35 @@ impl Contract {
             }),
         );
         None
+    }
+
+    /// Lazily opened map (no field on the contract struct, so redeploying needs no state migration).
+    fn pending_refunds() -> LookupMap<AccountId, u128> {
+        LookupMap::new(Keys::PendingRefunds)
+    }
+
+    /// Balance not locked for this account's own storage, keeping 0.5 NEAR for gas/state headroom.
+    fn free_balance() -> u128 {
+        let storage = env::storage_usage() as u128 * env::storage_byte_cost().as_yoctonear();
+        let headroom = NearToken::from_millinear(500).as_yoctonear();
+        env::account_balance().as_yoctonear().saturating_sub(storage + headroom)
+    }
+
+    pub fn get_pending_refund(&self, account_id: AccountId) -> String {
+        Self::pending_refunds().get(&account_id).copied().unwrap_or(0).to_string()
+    }
+
+    /// Founder pulls a refund that couldn't be paid inside the failed-create callback.
+    pub fn claim_refund(&mut self) -> Promise {
+        let who = env::predecessor_account_id();
+        let mut pending = Self::pending_refunds();
+        let owed = pending.get(&who).copied().unwrap_or(0);
+        require!(owed > 0, "nothing to refund");
+        require!(Self::free_balance() >= owed, "refund not available yet, try again shortly");
+        pending.remove(&who);
+        pending.flush();
+        emit("refund_claimed", json!({ "founder": who, "amount_yocto": owed.to_string() }));
+        Promise::new(who).transfer(NearToken::from_yoctonear(owed))
     }
 
     pub fn get_company(&self, slug: String) -> Option<CompanyMeta> {
@@ -218,5 +258,79 @@ impl Contract {
         require!(env::predecessor_account_id() == self.owner_id, "owner only");
         require!(amount.as_yoctonear() > 0, "amount > 0");
         Promise::new(to).transfer(amount)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use near_sdk::test_utils::VMContextBuilder;
+    use near_sdk::{testing_env, PromiseResult, RuntimeFeesConfig};
+    use near_sdk::test_vm_config;
+
+    fn acc(s: &str) -> AccountId {
+        s.parse().unwrap()
+    }
+
+    fn ctx(predecessor: &str, balance_near: u128, results: Vec<PromiseResult>) {
+        let context = VMContextBuilder::new()
+            .current_account_id(acc("builderos-wang.testnet"))
+            .predecessor_account_id(acc(predecessor))
+            .account_balance(NearToken::from_near(balance_near))
+            .build();
+        testing_env!(context, test_vm_config(), RuntimeFeesConfig::test(), Default::default(), results);
+    }
+
+    fn factory() -> Contract {
+        ctx("builderos-wang.testnet", 20, vec![]);
+        Contract::new(
+            acc("builderos-wang.testnet"),
+            acc("registry.builderos-wang.testnet"),
+            acc("v1.signer-prod.testnet"),
+            acc("worker.builderos-wang.testnet"),
+            acc("verifier.builderos-wang.testnet"),
+        )
+    }
+
+    fn fail_create(f: &mut Contract, balance_near: u128) -> Option<Promise> {
+        f.companies.insert(
+            "demo".into(),
+            CompanyMeta { company_id: acc("demo.builderos-wang.testnet"), founder: acc("alice.testnet"), name: "D".into(), preset: "p".into() },
+        );
+        ctx("builderos-wang.testnet", balance_near, vec![PromiseResult::Failed]);
+        f.on_company_created(
+            "demo".into(),
+            acc("demo.builderos-wang.testnet"),
+            acc("alice.testnet"),
+            "D".into(),
+            "p".into(),
+            NearToken::from_near(7),
+            Err(near_sdk::PromiseError::Failed),
+        )
+    }
+
+    #[test]
+    fn failed_create_refunds_now_when_balance_allows() {
+        let mut f = factory();
+        assert!(fail_create(&mut f, 30).is_some());
+        assert!(f.get_company("demo".into()).is_none(), "slug freed");
+        assert_eq!(f.get_pending_refund(acc("alice.testnet")), "0");
+    }
+
+    #[test]
+    fn failed_create_records_pending_refund_when_short() {
+        let mut f = factory();
+        // Storage of this tiny test state is near zero; 7 NEAR deposit > 5 NEAR balance - headroom.
+        assert!(fail_create(&mut f, 5).is_none());
+        assert!(f.get_company("demo".into()).is_none(), "slug freed even when refund is deferred");
+        assert_eq!(f.get_pending_refund(acc("alice.testnet")), NearToken::from_near(7).as_yoctonear().to_string());
+
+        ctx("alice.testnet", 5, vec![]);
+        let early = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f.claim_refund()));
+        assert!(early.is_err(), "can't claim before the bounced deposit arrives");
+
+        ctx("alice.testnet", 20, vec![]);
+        let _ = f.claim_refund();
+        assert_eq!(f.get_pending_refund(acc("alice.testnet")), "0");
     }
 }

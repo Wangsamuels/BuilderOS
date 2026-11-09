@@ -491,3 +491,12 @@ export const accountEmails = pgTable("account_emails", {
   emailCiphertext: text("email_ciphertext").notNull(),
   emailHash: text("email_hash").notNull(),
 });
+
+/** Testnet sponsor drips — persisted so a dyno restart can't be used to drain the sponsor. */
+export const testnetDrips = pgTable("testnet_drips", {
+  account: text("account").primaryKey(),
+  amount: amount("amount").notNull(),
+  txHash: text("tx_hash").notNull(),
+  ip: text("ip"),
+  createdAt: created(),
+});

@@ -64,22 +64,30 @@ The API never signs anything. Every write endpoint returns **unsigned NEAR trans
 
 Agents call paid APIs through **`@builderos/fetch`**, a drop-in `fetch` that acts as a spend firewall:
 
-1. The seller answers `402 Payment Required` with an x402 or MPP challenge.
-2. The SDK hashes the challenge and calls `request_purchase(seller, rail, amount, challenge_hash, task, model)` on the department contract with the agent's request-only key.
-3. The contract checks policy: allow-listed seller, per-transaction limit, budget, daily cap. If a human must approve, it yields and the task waits on the approval event.
-4. On approval, the contract asks Chain Signatures (`v1.signer`) to sign the payment. The SDK builds the payment header through the rail adapter and retries the call.
-5. The SDK records `record_response(request_id, response_hash, foreign_tx, outcome)`, and the indexer turns it into a receipt. The verifier checks the foreign transaction on Base or Tempo.
+1. The seller answers `402 Payment Required` with an x402 challenge.
+2. The SDK hashes the challenge and calls `request_purchase(seller, rail, amount, challenge_hash, task, model, challenge)` on the team contract with the agent's limited key.
+3. The **team contract** checks, in order:
+   - the payee: an allow-listed seller can only be paid at its registered address, and anything else is blocked as an attack
+   - the asset and chain: only the team's USDC on Base
+   - the budget: a hard stop
+   - the per-transaction limit, the task's cost cap, and whether the seller is on the allow-list
+4. The **company contract** checks that the company isn't frozen and applies the company-wide **daily cap**.
+5. Within every limit, the team contract builds the USDC `TransferWithAuthorization` (EIP-3009) itself and asks Chain Signatures (`v1.signer`) to sign it with the team's derived Base key. Only that contract can ask for that key.
+6. Otherwise the request becomes an **approval card**: `purchase_yielded` has the reason (`over_limit`, `new_seller`, `over_task_cap`, `unassigned_task`, `daily_cap`), and the budget stays reserved. A founder or approver signs `approve` (or `reject`). The agent then calls `sign_approved` and gets the signature. A task that parked meanwhile reuses the approved request when it resumes.
+7. The SDK sends the `X-PAYMENT` header and records `record_response(...)`. The indexer writes the receipt, and the verifier checks the Base transaction.
 
-The SDK never supplies the payee or a hash to sign. Before paying, it refuses if the seller's `payTo` differs from what the contract authorised. A compromised agent can at most overbuy from allow-listed sellers, within caps.
+The SDK never supplies the payee or the hash to sign; the contract builds both. A compromised agent can at most buy from allow-listed sellers within the caps, and everything else waits for a person.
+
+Fund each team's Base address (shown by `GET /v1/companies/:id/payments`) with USDC so agents can pay.
 
 ### Payment rails
 
 | Adapter | Builds | Notes |
 |---|---|---|
-| `x402-evm` | `X-PAYMENT` header from an EIP-3009 signature | Base Sepolia → Base; the facilitator pays gas |
-| `mpp-tempo` charge | Tempo transaction with a TIP-20 transfer | Gated by `TEMPO_ENABLED` |
+| `x402-evm` | `X-PAYMENT` header from an EIP-3009 signature built and signed by the team contract via Chain Signatures | Base Sepolia → Base; the facilitator pays gas |
+| `mpp-tempo` charge (not contract-signed yet: the contract refuses it and the router falls back to x402) | Tempo transaction with a TIP-20 transfer | Gated by `TEMPO_ENABLED` |
 | `mpp-tempo` session | Payment channel opened via Chain Signatures | Session wallet holds exactly the cap (≤ $5), swept on close |
-| `x402-near` | Delegated `ft_transfer` | Stretch goal |
+| `x402-near` | Delegated `ft_transfer` | Stretch goal (not contract-signed yet) |
 
 The **model router** scores Near AI models in the chosen tier and pays them with **x402 on Base USDC** (department Chain Signatures Base address). Tempo/MPP is not used for inference.
 
@@ -129,6 +137,19 @@ It stores the last processed block height and replays from it after a restart. R
 
 - **Sign-in:** the browser signs a NEP-413 challenge with its NEAR key. The API verifies the signature and checks that the key is a full-access key on the account via RPC. It then issues an HTTP-only session cookie (24 h, rotated) and returns a bearer token as a fallback for browsers that block third-party cookies.
 - **Authorisation:** before building any transaction, the API re-checks the caller on chain (founder, or `get_grant` with the right scope, expiry and revocation).
+- **The founder decides who sees what.** Nobody but the founder has access until the founder signs an `invite` and the member accepts it. The grant sets the scopes and, unless it's `admin`, the one team it covers. The API reads it live from the company contract on every request:
+
+  | Grant | Can see | Can do |
+  |---|---|---|
+  | Founder | everything | everything, including invite/revoke, keys, withdrawals, resume spending |
+  | `admin` (founder-appointed) | everything | approve, assign tasks, change tiers/floats, pause spending |
+  | `approve` | approval cards, money receipts for their team | approve / reject purchases |
+  | `builder` | plans, tasks, hires for their team | create plans |
+  | `view` | money receipts and budget for their team | — |
+
+  The live event stream is filtered the same way. Member lists, audit and permission/key events are founder/admin only.
+- **No one holds a key to the company or team accounts.** The factory and company create those accounts without adding anyone's key, so even the founder can't sign as them and skip the rules. Agent keys are added by the team contract itself (`register_agent`, founder or admin), limited to `request_purchase`, `record_response` and `create_bounty`. The spend methods reject every other caller. Code changes need a founder `propose_upgrade` that every member can see, then a 24 h wait before `apply_upgrade` deploys exactly that code.
+- **Department changes go through the company contract.** Teams only accept policy calls from their company, so `assign_task`, tier, float, seller and per-team pause changes are sent as `company.dept_call`, which checks the signer's grant first. "Pause all" is one `company.freeze` that freezes every team; resuming is founder-only.
 - **Key service:** it stores keys only in wrapped form (sealed to each member's x25519 view key) and releases them after an on-chain grant check. It never sees a plaintext key. On `grant_revoked`, it deletes that member's copies and prompts the founder to rotate the code key.
 - **Viewers** see money receipts only, and only for the teams they're granted.
 
@@ -141,7 +162,8 @@ REST + JSON under `/v1`, validated with zod. Rate limits are 60 writes per minut
 | Endpoint | Does |
 |---|---|
 | `GET /auth/challenge` · `POST /auth/verify` · `GET /auth/me` | NEAR sign-in |
-| `POST /companies` · `GET /companies[/:id]` | Create a company from a preset → `create_company`, departments, caps |
+| `POST /companies` · `GET /companies[/:id]` | Create a company from a preset → `create_company`, departments, caps. Checks the slug and wallet balance first; a partial create resumes with only the missing steps |
+| `GET /companies/creation/:slug` · `POST /companies/claim-refund` | On-chain create status (no indexer needed) · claim a deferred refund after a failed create |
 | `POST /plans` · `POST /plans/:id/approve` | Run the planner; turn an approved plan into `assign_task` transactions |
 | `GET /estimate` | Cost per tier (p50, p90, cap) for a task tag and size |
 | `GET /tasks` · `PATCH /tasks/:id` | Task list; change tier or pin a model → `set_task_tier` |
@@ -152,7 +174,7 @@ REST + JSON under `/v1`, validated with zod. Rate limits are 60 writes per minut
 | `GET/PATCH /floats/tempo` | Tempo pocket status and settings → `set_rail_float` |
 | `POST /withdrawals` | Plan a withdrawal (sources, quotes, fees) → `request_withdrawal` |
 | `POST /keys/code/rotate` · `GET/POST /keys/wrapped` | Founder-only key rotation; wrapped key store |
-| `POST /freeze` | Pause all spending → `freeze` per team |
+| `POST /freeze` · `POST /unfreeze` | Pause all spending (one `company.freeze`, cascades to teams; or chosen teams) · resume (founder only) |
 | `GET /stream` | Live events (SSE), resumable by `Last-Event-ID` |
 | `GET /status` · `GET /health` | Indexer lag, queue depth, failed jobs, bridges in flight |
 

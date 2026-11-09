@@ -27,8 +27,10 @@ export function createLogger(service: string) {
 export type Logger = ReturnType<typeof createLogger>;
 
 export class HttpError extends Error {
-  constructor(public status: number, message: string, public code = "error") {
+  details?: unknown;
+  constructor(public status: number, message: string, public code = "error", details?: unknown) {
     super(message);
+    this.details = details;
   }
 }
 

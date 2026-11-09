@@ -35,19 +35,68 @@ export const VerifyBody = z.object({
   callbackUrl: z.string().optional(),
 });
 
-export const CreateCompanyBody = z.object({
-  name: z.string().min(2).max(64),
-  slug: z.string().regex(/^[a-z0-9-]{2,32}$/),
-  preset: z.string().default("saas-starter"),
-  dailyCap: z.string().regex(/^\d+$/).default("50000000"), // USDC 6dp
-  departments: z
-    .array(z.object({ name: z.string(), budget: z.string().regex(/^\d+$/), perTxLimit: z.string().regex(/^\d+$/) }))
-    .default([
-      { name: "build", budget: "100000000", perTxLimit: "5000000" },
-      { name: "ops", budget: "30000000", perTxLimit: "2000000" },
-      { name: "growth", budget: "20000000", perTxLimit: "2000000" },
-    ]),
+/** Department label: lowercase, becomes `<name>.<company>` on chain. */
+export const DepartmentName = z
+  .string()
+  .transform((v) => v.trim().toLowerCase())
+  .pipe(z.string().regex(/^[a-z0-9](?:[a-z0-9_-]{0,18}[a-z0-9])?$/, "team names: 1-20 chars, a-z 0-9 - _ (no spaces)"));
+
+/**
+ * USDC amount. Integer strings are already in micro-USDC (6dp, the backend's unit everywhere);
+ * a decimal string ("12.5") is read as dollars and converted.
+ */
+export const UsdcAmount = z.union([z.string(), z.number()]).transform((v, ctx) => {
+  const s = String(v).trim();
+  if (/^\d+$/.test(s)) return s;
+  const m = /^(\d+)\.(\d{1,6})$/.exec(s);
+  if (m) return (BigInt(m[1]) * 1_000_000n + BigInt(m[2].padEnd(6, "0"))).toString();
+  ctx.addIssue({ code: "custom", message: "amount must be micro-USDC integer or a dollar decimal" });
+  return z.NEVER;
 });
+
+const DEFAULT_DEPARTMENTS = [
+  { name: "build", budget: "100000000", perTxLimit: "5000000" },
+  { name: "ops", budget: "30000000", perTxLimit: "2000000" },
+  { name: "growth", budget: "20000000", perTxLimit: "2000000" },
+];
+
+export const CreateCompanyBody = z
+  .object({
+    name: z.string().min(2).max(64),
+    slug: z.string().regex(/^[a-z0-9-]{2,32}$/),
+    preset: z.string().default("saas-starter"),
+    dailyCap: UsdcAmount.default("50000000"),
+    departments: z.array(z.object({ name: DepartmentName, budget: UsdcAmount, perTxLimit: UsdcAmount })).min(1).max(6).optional(),
+    /** Web app shape: teams[{ team, monthlyCap }] (mapped to departments; per-tx limit = autoApproveLimit or 5% of the cap). */
+    teams: z.array(z.object({ team: DepartmentName, monthlyCap: UsdcAmount })).min(1).max(6).optional(),
+    autoApproveLimit: UsdcAmount.optional(),
+  })
+  .transform((b) => {
+    const departments =
+      b.departments ??
+      (b.teams
+        ? b.teams.map((t) => {
+            const fivePct = (BigInt(t.monthlyCap) / 20n).toString();
+            const perTx = b.autoApproveLimit && BigInt(b.autoApproveLimit) <= BigInt(t.monthlyCap) ? b.autoApproveLimit : fivePct;
+            return { name: t.team, budget: t.monthlyCap, perTxLimit: perTx };
+          })
+        : DEFAULT_DEPARTMENTS);
+    return { name: b.name, slug: b.slug, preset: b.preset, dailyCap: b.dailyCap, departments };
+  })
+  .superRefine((b, ctx) => {
+    const names = b.departments.map((d) => d.name);
+    if (new Set(names).size !== names.length) ctx.addIssue({ code: "custom", message: "team names must be unique", path: ["departments"] });
+    for (const d of b.departments)
+      if (BigInt(d.perTxLimit) > BigInt(d.budget)) ctx.addIssue({ code: "custom", message: `${d.name}: per-transaction limit is above the budget`, path: ["departments"] });
+  });
+
+export const RegisterAgentBody = z.object({
+  companyId: z.string(),
+  departmentId: z.string(),
+  publicKey: z.string().regex(/^ed25519:[1-9A-HJ-NP-Za-km-z]{43,44}$/, "ed25519:<base58> public key"),
+  role: z.string().min(2).max(32),
+});
+export const AgentStatusBody = z.object({ companyId: z.string(), status: z.enum(["running", "paused", "fired"]) });
 
 export const CreatePlanBody = z.object({
   companyId: z.string(),
@@ -71,7 +120,19 @@ export const HireOptionsQuery = z.object({
   tag: z.string().optional(),
 });
 
-export const DecideApprovalBody = z.object({ decision: z.enum(["approve", "reject"]) });
+export const DecideApprovalBody = z.object({
+  decision: z.enum(["approve", "reject"]),
+  /** Seller cards: also allow-list this seller at the payee shown on the card ("Always use this"). */
+  alwaysAllow: z.boolean().default(false),
+});
+
+export const AllowSellerBody = z.object({
+  companyId: z.string(),
+  departmentId: z.string(),
+  sellerId: z.string().min(1).max(128),
+  /** EVM address the seller may be paid at; null removes the seller from the allow-list. */
+  payTo: z.string().regex(/^0x[0-9a-fA-F]{40}$/).nullable(),
+});
 
 export const LedgerQuery = z.object({
   companyId: z.string(),

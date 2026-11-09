@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { DecideApprovalBody, FreezeBody, HttpError, LedgerQuery, MONEY_RECEIPT_KINDS, TempoFloatBody, WithdrawalBody, toBig, type UnsignedTx } from "@builderos/shared";
 import { and, approvalCards, departments, desc, eq, getDb, inArray, keyAccessLog, lt, railFloats, receipts, sql } from "@builderos/db";
 import { tx, view, views } from "@builderos/near";
-import { authorize, requireAccount, requireFounder } from "../auth.js";
+import { authorize, departmentScope, requireAccount, requireFounder } from "../auth.js";
 import { parse } from "../app.js";
 
 const csvCell = (v: unknown) => {
@@ -17,7 +17,8 @@ export const moneyRoutes: FastifyPluginAsync = async (app) => {
     const account = requireAccount(req);
     const { companyId, status = "pending" } = req.query;
     if (!companyId) throw new HttpError(400, "companyId required");
-    await authorize(account, companyId, ["approve", "view"]);
+    // Approval cards are for people the founder made approvers (or admins).
+    await authorize(account, companyId, ["approve"]);
     const cards = await getDb()
       .select()
       .from(approvalCards)
@@ -29,32 +30,36 @@ export const moneyRoutes: FastifyPluginAsync = async (app) => {
   /** Approve / reject a card → one batched transaction for all its requests (the daily card covers many). */
   app.post<{ Params: { id: string } }>("/approvals/:id", async (req) => {
     const account = requireAccount(req);
-    const { decision } = parse(DecideApprovalBody, req.body);
+    const { decision, alwaysAllow } = parse(DecideApprovalBody, req.body);
     const [card] = await getDb().select().from(approvalCards).where(eq(approvalCards.id, req.params.id));
     if (!card) throw new HttpError(404, "card not found");
     if (card.status !== "pending") throw new HttpError(409, `card is ${card.status}`);
     await authorize(account, card.companyId, ["approve"]);
-    // The contract re-checks approver limits; we only build the tx.
-    const t = decision === "approve" ? tx.approve(card.companyId, card.requestIds, card.id) : tx.reject(card.companyId, card.requestIds, card.id);
-    return { card, transaction: t };
+    // The contract re-checks the approver's grant; approving tells each team to let its agent get the
+    // Chain Signatures signature. Big daily cards are split into ≤20 requests per tx.
+    const transactions: UnsignedTx[] =
+      decision === "approve" ? tx.approve(card.companyId, card.requestIds, card.id) : tx.reject(card.companyId, card.requestIds, card.id);
+    const p = (card.payload ?? {}) as { department_id?: string; seller_id?: string; pay_to?: string };
+    if (decision === "approve" && alwaysAllow) {
+      // Allow-listing changes team policy: founder/admin only.
+      if (!p.department_id || !p.seller_id || !p.pay_to) throw new HttpError(400, "this card has no seller to allow-list", "invalid_request");
+      await authorize(account, card.companyId, ["admin"]);
+      transactions.push(tx.allowSeller(p.department_id, p.seller_id, p.pay_to));
+    }
+    return { card, transaction: transactions[0], transactions };
   });
 
   // ---------- ledger / audit / receipts ----------
   app.get("/ledger", async (req, reply) => {
     const account = requireAccount(req);
     const q = parse(LedgerQuery, req.query);
-    const { founder, grant } = await authorize(account, q.companyId, ["view", "approve"]);
+    const access = await authorize(account, q.companyId, ["view", "approve"]);
     const conds = [eq(receipts.companyId, q.companyId), inArray(receipts.kind, MONEY_RECEIPT_KINDS)];
     if (q.kind) conds.push(eq(receipts.kind, q.kind));
     if (q.departmentId) conds.push(eq(receipts.departmentId, q.departmentId));
-    // Viewers only see money receipts for the teams they're granted.
-    if (!founder && grant && !grant.scopes.includes("admin")) {
-      const granted = await getDb().execute<{ department_id: string }>(
-        sql`select department_id from members_cache where account_id = ${account} and company_id = ${q.companyId} and not revoked`,
-      );
-      const ids = granted.rows.map((r) => r.department_id);
-      conds.push(ids.length ? inArray(receipts.departmentId, ids) : sql`false`);
-    }
+    // Members only see money receipts for the team the founder granted them (read live from chain).
+    const allowed = departmentScope(access);
+    if (allowed) conds.push(inArray(receipts.departmentId, allowed));
     if (q.before) conds.push(lt(receipts.blockHeight, q.before));
     const rows = await getDb()
       .select()
@@ -92,8 +97,10 @@ export const moneyRoutes: FastifyPluginAsync = async (app) => {
     const account = requireAccount(req);
     const [r] = await getDb().select().from(receipts).where(eq(receipts.id, req.params.id));
     if (!r || !r.companyId) throw new HttpError(404, "receipt not found");
-    const { founder, grant } = await authorize(account, r.companyId, ["view", "approve"]);
-    if (!founder && !grant?.scopes.includes("admin") && !MONEY_RECEIPT_KINDS.includes(r.kind as any)) throw new HttpError(403, "viewers see money receipts only");
+    const access = await authorize(account, r.companyId, ["view", "approve"]);
+    if (!access.admin && !MONEY_RECEIPT_KINDS.includes(r.kind as any)) throw new HttpError(403, "members see money receipts only", "forbidden");
+    const allowed = departmentScope(access);
+    if (allowed && (!r.departmentId || !allowed.includes(r.departmentId))) throw new HttpError(403, "not your team", "forbidden");
     return { receipt: r };
   });
 
@@ -102,13 +109,14 @@ export const moneyRoutes: FastifyPluginAsync = async (app) => {
     const account = requireAccount(req);
     const { companyId } = req.query;
     if (!companyId) throw new HttpError(400, "companyId required");
-    await authorize(account, companyId, ["view"]);
+    const access = await authorize(account, companyId, ["view"]);
+    const allowed = departmentScope(access);
     const r = await getDb().execute(sql`
       select d.id as department_id, d.name, f.target, f.balance, f.reserved, f.enabled, f.paused, f.topups_today, f.updated_at,
         (select count(*) from bridge_transfers b where b.department_id = d.id and b.status in ('requested','bridging'))::int as in_flight
       from departments d left join rail_floats f on f.department_id = d.id and f.rail = 'tempo'
       where d.company_id = ${companyId}`);
-    return { floats: r.rows };
+    return { floats: allowed ? r.rows.filter((row: any) => allowed.includes(row.department_id)) : r.rows };
   });
 
   app.patch("/floats/tempo", async (req) => {
@@ -157,10 +165,13 @@ export const moneyRoutes: FastifyPluginAsync = async (app) => {
     const account = requireAccount(req);
     const body = parse(FreezeBody, req.body);
     await authorize(account, body.companyId, ["admin"]);
-    const depts = body.departments?.length
-      ? body.departments
-      : (await getDb().select({ id: departments.id }).from(departments).where(eq(departments.companyId, body.companyId))).map((d) => d.id);
-    const transactions: UnsignedTx[] = [tx.freeze(body.companyId), ...depts.map((d) => tx.freeze(d))];
+    // Whole company: one tx, the company contract freezes every department itself.
+    // Selected teams: forwarded through company.dept_call (departments only obey the company).
+    for (const d of body.departments ?? [])
+      if (!d.endsWith(`.${body.companyId}`)) throw new HttpError(400, `${d} is not a team of ${body.companyId}`, "invalid_request");
+    const transactions: UnsignedTx[] = body.departments?.length
+      ? tx.freezeDepartments(body.companyId, body.departments)
+      : [tx.freeze(body.companyId)];
     return { transactions };
   });
 
@@ -168,8 +179,8 @@ export const moneyRoutes: FastifyPluginAsync = async (app) => {
     const account = requireAccount(req);
     const body = parse(FreezeBody, req.body);
     await requireFounder(account, body.companyId);
-    const depts = (await getDb().select({ id: departments.id }).from(departments).where(eq(departments.companyId, body.companyId))).map((d) => d.id);
-    return { transactions: [tx.unfreeze(body.companyId), ...depts.map((d) => tx.unfreeze(d))] };
+    // Resuming spend is founder-only; the company contract unfreezes every department.
+    return { transactions: [tx.unfreeze(body.companyId)] };
   });
 
   void views;
