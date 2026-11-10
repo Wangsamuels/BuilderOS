@@ -110,9 +110,10 @@ export const coreRoutes: FastifyPluginAsync = async (app) => {
   /** On-chain creation status for a slug (no indexer needed). Details only for the founder. */
   app.get<{ Params: { slug: string } }>("/companies/creation/:slug", async (req) => {
     const account = requireAccount(req);
-    if (!/^[a-z0-9-]{2,32}$/.test(req.params.slug)) throw new HttpError(400, "invalid slug", "invalid_request");
-    const st = await creationState(req.params.slug, account);
-    if (st.slugTaken && !st.founderIsYou) return { slug: req.params.slug, slugTaken: true, founderIsYou: false };
+    const slug = req.params.slug.toLowerCase().split(".")[0]; // accepts "sezk" or "sezk.<factory>"
+    if (!/^[a-z0-9-]{2,32}$/.test(slug)) throw new HttpError(400, "invalid slug", "invalid_request");
+    const st = await creationState(slug, account);
+    if (st.slugTaken && !st.founderIsYou) return { slug, slugTaken: true, founderIsYou: false };
     return st;
   });
 

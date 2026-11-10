@@ -94,3 +94,10 @@ describe("legacy company batching (joint promise)", () => {
     expect(tx.approve(co, ["a", "b", "c"], "card", 1)).toHaveLength(3);
   });
 });
+
+describe("create body slug", () => {
+  it("accepts the full company account id as the slug", () => {
+    expect(CreateCompanyBody.parse({ name: "Sezk", slug: "sezk.builderos-wang.testnet" }).slug).toBe("sezk");
+    expect(() => CreateCompanyBody.parse({ name: "Sezk", slug: "Bad Slug!" })).toThrow();
+  });
+});

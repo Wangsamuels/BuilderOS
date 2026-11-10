@@ -63,7 +63,8 @@ const DEFAULT_DEPARTMENTS = [
 export const CreateCompanyBody = z
   .object({
     name: z.string().min(2).max(64),
-    slug: z.string().regex(/^[a-z0-9-]{2,32}$/),
+    /** "sezk" or the full company account "sezk.<factory>" (normalised to "sezk"). */
+    slug: z.preprocess((v) => (typeof v === "string" ? v.trim().toLowerCase().split(".")[0] : v), z.string().regex(/^[a-z0-9-]{2,32}$/)),
     preset: z.string().default("saas-starter"),
     dailyCap: UsdcAmount.default("50000000"),
     departments: z.array(z.object({ name: DepartmentName, budget: UsdcAmount, perTxLimit: UsdcAmount })).min(1).max(6).optional(),
