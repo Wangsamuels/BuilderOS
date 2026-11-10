@@ -15,7 +15,7 @@ import {
   type UnsignedTx,
 } from "@builderos/shared";
 import { agents, and, companies, departments, desc, eq, getDb, hires, inArray, plans, sellerOptions, tasks } from "@builderos/db";
-import { companyAccount, companyCreateFunding, departmentAccount, teamEvmConfig, tx, viewAccount, views, yoctoToNear } from "@builderos/near";
+import { batchLimits, companyAccount, companyCreateFunding, departmentAccount, teamEvmConfig, tx, viewAccount, views, yoctoToNear } from "@builderos/near";
 import { estimate, type Tier } from "@builderos/router";
 import { listHireableAgents, nicheNecessity, HIRE_NECESSITY_MIN, plan as runPlanner, rankHireCandidates, ROLE_FOR_TAG, topoOrder } from "@builderos/orchestrator";
 import { parseChallenges, challengeAmount } from "@builderos/rails";
@@ -171,7 +171,8 @@ export const coreRoutes: FastifyPluginAsync = async (app) => {
         const r = byId.get(id)!;
         return tx.assignTaskCall(r.departmentId ?? `build.${p.companyId}`, { taskId: r.id, tier: r.tier ?? p.tier, cap: r.cap ?? "0", tag: r.tag, agentRole: ROLE_FOR_TAG[r.tag] ?? "backend", dependsOn: r.dependsOn });
       });
-      const transactions = tx.deptCalls(p.companyId, calls).map((t) => ({ ...t, signerId: account }));
+      const { deptCallsPerTx } = await batchLimits(p.companyId);
+      const transactions = tx.deptCalls(p.companyId, calls, deptCallsPerTx).map((t) => ({ ...t, signerId: account }));
       return { tasks: pending, transactions, resumed: true };
     }
 
@@ -220,7 +221,8 @@ export const coreRoutes: FastifyPluginAsync = async (app) => {
       await t.update(plans).set({ approvedAt: new Date() }).where(eq(plans.id, p.id));
     });
     // assign_task goes through company.dept_call (departments only accept the company as caller).
-    const transactions: UnsignedTx[] = tx.deptCalls(p.companyId, calls).map((t) => ({ ...t, signerId: account }));
+    const { deptCallsPerTx } = await batchLimits(p.companyId);
+    const transactions: UnsignedTx[] = tx.deptCalls(p.companyId, calls, deptCallsPerTx).map((t) => ({ ...t, signerId: account }));
     return { tasks: rows, transactions, resumed: false };
   });
 

@@ -2,7 +2,7 @@ import type { FastifyPluginAsync } from "fastify";
 import { randomUUID } from "node:crypto";
 import { DecideApprovalBody, FreezeBody, HttpError, LedgerQuery, MONEY_RECEIPT_KINDS, TempoFloatBody, WithdrawalBody, toBig, type UnsignedTx } from "@builderos/shared";
 import { and, approvalCards, departments, desc, eq, getDb, inArray, keyAccessLog, lt, railFloats, receipts, sql } from "@builderos/db";
-import { tx, view, views } from "@builderos/near";
+import { batchLimits, tx, view, views } from "@builderos/near";
 import { authorize, departmentScope, requireAccount, requireFounder } from "../auth.js";
 import { parse } from "../app.js";
 
@@ -37,8 +37,11 @@ export const moneyRoutes: FastifyPluginAsync = async (app) => {
     await authorize(account, card.companyId, ["approve"]);
     // The contract re-checks the approver's grant; approving tells each team to let its agent get the
     // Chain Signatures signature. Big daily cards are split into ≤20 requests per tx.
+    const { approvalsPerTx } = await batchLimits(card.companyId);
     const transactions: UnsignedTx[] =
-      decision === "approve" ? tx.approve(card.companyId, card.requestIds, card.id) : tx.reject(card.companyId, card.requestIds, card.id);
+      decision === "approve"
+        ? tx.approve(card.companyId, card.requestIds, card.id, approvalsPerTx)
+        : tx.reject(card.companyId, card.requestIds, card.id, approvalsPerTx);
     const p = (card.payload ?? {}) as { department_id?: string; seller_id?: string; pay_to?: string };
     if (decision === "approve" && alwaysAllow) {
       // Allow-listing changes team policy: founder/admin only.
@@ -169,10 +172,14 @@ export const moneyRoutes: FastifyPluginAsync = async (app) => {
     // Selected teams: forwarded through company.dept_call (departments only obey the company).
     for (const d of body.departments ?? [])
       if (!d.endsWith(`.${body.companyId}`)) throw new HttpError(400, `${d} is not a team of ${body.companyId}`, "invalid_request");
-    const transactions: UnsignedTx[] = body.departments?.length
-      ? tx.freezeDepartments(body.companyId, body.departments)
-      : [tx.freeze(body.companyId)];
-    return { transactions };
+    const lim = await batchLimits(body.companyId);
+    if (body.departments?.length) return { transactions: tx.freezeDepartments(body.companyId, body.departments, lim.deptCallsPerTx) };
+    if (lim.legacy) {
+      // Older company code can't cascade to 2+ teams (joint promise). Freeze every team, one tx each.
+      const ids = (await views.getDepartments(body.companyId).catch(() => [])).map((d) => d.department_id);
+      if (ids.length > 1) return { transactions: tx.freezeDepartments(body.companyId, ids, 1), legacy: true };
+    }
+    return { transactions: [tx.freeze(body.companyId)] };
   });
 
   app.post("/unfreeze", async (req) => {

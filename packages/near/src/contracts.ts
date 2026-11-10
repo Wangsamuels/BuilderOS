@@ -67,10 +67,14 @@ function assignTaskCall(departmentId: string, t: TaskAssign): DeptCall {
 }
 
 /** Batch department calls for one company into as few transactions as possible. */
-function deptCalls(companyId: string, calls: DeptCall[]): UnsignedTx[] {
-  const out: UnsignedTx[] = [];
-  for (let i = 0; i < calls.length; i += DEPT_CALLS_PER_TX) out.push(deptCall(companyId, calls.slice(i, i + DEPT_CALLS_PER_TX)));
-  return out;
+/**
+ * `perTx` = 1 for companies on code older than contract_version 2: their dept_call/approve/freeze return a
+ * joint promise when given several calls, which NEAR refuses ("Returning joint promise is currently prohibited").
+ * One call per tx returns a plain promise and works on every version.
+ */
+function deptCalls(companyId: string, calls: DeptCall[], perTx = DEPT_CALLS_PER_TX): UnsignedTx[] {
+  const n = Math.max(1, Math.min(perTx, DEPT_CALLS_PER_TX));
+  return chunks(calls, n).map((c) => deptCall(companyId, c));
 }
 
 // ---------------- transactions a person signs in the browser ----------------
@@ -103,10 +107,10 @@ export const tx = {
   },
 
   /** Approve waiting purchases; each tells its team to let the agent get the Chain Signatures signature. ≤20 per tx. */
-  approve: (companyId: string, requestIds: string[], cardId?: string): UnsignedTx[] =>
-    chunks(requestIds, APPROVALS_PER_TX).map((ids) => call(companyId, "approve", { request_ids: ids, card_id: cardId ?? null }, Math.min(300, 20 + 12 * ids.length), ONE_YOCTO)),
-  reject: (companyId: string, requestIds: string[], cardId?: string): UnsignedTx[] =>
-    chunks(requestIds, APPROVALS_PER_TX).map((ids) => call(companyId, "reject", { request_ids: ids, card_id: cardId ?? null }, Math.min(300, 20 + 12 * ids.length), ONE_YOCTO)),
+  approve: (companyId: string, requestIds: string[], cardId?: string, perTx = APPROVALS_PER_TX): UnsignedTx[] =>
+    chunks(requestIds, Math.max(1, Math.min(perTx, APPROVALS_PER_TX))).map((ids) => call(companyId, "approve", { request_ids: ids, card_id: cardId ?? null }, Math.min(300, 20 + 12 * ids.length), ONE_YOCTO)),
+  reject: (companyId: string, requestIds: string[], cardId?: string, perTx = APPROVALS_PER_TX): UnsignedTx[] =>
+    chunks(requestIds, Math.max(1, Math.min(perTx, APPROVALS_PER_TX))).map((ids) => call(companyId, "reject", { request_ids: ids, card_id: cardId ?? null }, Math.min(300, 20 + 12 * ids.length), ONE_YOCTO)),
 
   /** Founder/admin: allow-list a seller and the only address it may be paid at (null removes it). */
   allowSeller: (departmentId: string, sellerId: string, payTo: string | null) => {
@@ -138,10 +142,11 @@ export const tx = {
   /** Pause all spending: freezes the company and every department (cascade on chain). Founder or admin. */
   freeze: (companyId: string) => call(companyId, "freeze", {}, 150, ONE_YOCTO),
   /** Pause selected teams only. Founder or admin. */
-  freezeDepartments: (companyId: string, departmentIds: string[]) =>
+  freezeDepartments: (companyId: string, departmentIds: string[], perTx = DEPT_CALLS_PER_TX) =>
     deptCalls(
       companyId,
       departmentIds.map((d) => ({ department: splitDepartment(d).name, method: "freeze" as const, args: {} })),
+      perTx,
     ),
   /** Resume: company + every department. Founder only. */
   unfreeze: (companyId: string) => call(companyId, "unfreeze", {}, 150, ONE_YOCTO),
@@ -267,6 +272,21 @@ export type Grant = {
   expires_at_ms: number | null;
   revoked: boolean;
 };
+
+const versionCache = new Map<string, { v: number; at: number }>();
+/** contract_version of a company (0 = older code without the method). Cached for 5 minutes. */
+async function companyVersion(companyId: string): Promise<number> {
+  const hit = versionCache.get(companyId);
+  if (hit && Date.now() - hit.at < 300_000) return hit.v;
+  const v = await view<number>(companyId, "contract_version", {}).then(Number).catch(() => 0);
+  versionCache.set(companyId, { v, at: Date.now() });
+  return v;
+}
+/** How many calls one tx may carry for this company (1 on legacy code, see deptCalls). */
+export async function batchLimits(companyId: string) {
+  const ok = (await companyVersion(companyId)) >= 2;
+  return { legacy: !ok, deptCallsPerTx: ok ? DEPT_CALLS_PER_TX : 1, approvalsPerTx: ok ? APPROVALS_PER_TX : 1 };
+}
 
 export const views = {
   getGrant: (target: string, account: string) => view<Grant | null>(target, "get_grant", { account_id: account }),

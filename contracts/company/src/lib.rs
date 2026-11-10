@@ -239,22 +239,54 @@ impl Contract {
         require!(!calls.is_empty() && calls.len() <= 12, "1..=12 calls");
         let deposit_needed = calls.len() as u128;
         require!(env::attached_deposit().as_yoctonear() >= deposit_needed, "attach 1 yocto per call");
-        let mut promise: Option<Promise> = None;
+        let mut out = Vec::with_capacity(calls.len());
         for c in calls {
             require!(DEPT_FORWARD_METHODS.contains(&c.method.as_str()), "method not allowed");
             let dept = self.departments.get(&c.department).cloned().expect("unknown department");
             let args = near_sdk::serde_json::to_vec(&c.args).expect("bad args");
-            let p = Promise::new(dept).function_call(c.method, args, NearToken::from_yoctonear(1), Gas::from_tgas(15));
-            promise = Some(match promise {
-                None => p,
-                Some(prev) => prev.and(p),
-            });
+            out.push((dept, c.method, args, NearToken::from_yoctonear(1), Gas::from_tgas(15)));
         }
-        promise.unwrap()
+        Self::fan_out(out).expect("1..=12 calls")
+    }
+
+    /// NEAR forbids returning a joint promise (`a.and(b)`) — the tx fails with
+    /// "Returning joint promise is currently prohibited". So calls to the same team are batched into ONE
+    /// receipt (atomic, in order), and when several teams are involved the joint promise is followed by
+    /// `on_fan_out`, which fails the tx if any team call failed.
+    fn fan_out(calls: Vec<(AccountId, String, Vec<u8>, NearToken, Gas)>) -> Option<Promise> {
+        let mut groups: Vec<(AccountId, Promise)> = Vec::new();
+        for (receiver, method, args, deposit, gas) in calls {
+            if let Some(i) = groups.iter().position(|(r, _)| *r == receiver) {
+                let (r, p) = groups.remove(i);
+                groups.insert(i, (r, p.function_call(method, args, deposit, gas)));
+            } else {
+                let p = Promise::new(receiver.clone()).function_call(method, args, deposit, gas);
+                groups.push((receiver, p));
+            }
+        }
+        let many = groups.len() > 1;
+        let joint = groups.into_iter().map(|(_, p)| p).reduce(|a, b| a.and(b))?;
+        Some(if many { joint.then(Self::ext(env::current_account_id()).with_static_gas(Gas::from_tgas(5)).on_fan_out()) } else { joint })
+    }
+
+    /// Callback after a multi-team fan-out: surface any failed team call as a failed transaction.
+    #[private]
+    pub fn on_fan_out(&self) {
+        let n = env::promise_results_count();
+        for i in 0..n {
+            if matches!(env::promise_result_checked(i, 16_384), Err(PromiseError::Failed)) {
+                env::panic_str(&format!("team call {i} of {n} failed"));
+            }
+        }
     }
 
     fn promise_failed() -> bool {
         matches!(env::promise_result_checked(0, 16_384), Err(PromiseError::Failed))
+    }
+
+    /// 2 = calls to several teams are batched safely (no joint promise returned). Older code has no such method.
+    pub fn contract_version(&self) -> u32 {
+        2
     }
 
     pub fn get_company(&self) -> CompanyView {
@@ -428,7 +460,7 @@ impl Contract {
         require!(!self.frozen, "frozen");
         self.roll_day();
         let approver = env::predecessor_account_id();
-        let mut promise: Option<Promise> = None;
+        let mut out = Vec::with_capacity(request_ids.len());
         for request_id in &request_ids {
             let p = self.pending_approvals.remove(request_id).expect("request is not waiting for approval");
             self.spent_today += p.amount;
@@ -436,18 +468,15 @@ impl Contract {
                 "purchase_approved",
                 json!({ "request_id": request_id, "approvers": [approver], "card_id": card_id, "amount": p.amount.to_string(), "department_id": p.department }),
             );
-            let call = Promise::new(p.department).function_call(
-                "mark_approved",
+            out.push((
+                p.department,
+                "mark_approved".to_string(),
                 near_sdk::serde_json::to_vec(&json!({ "request_id": request_id })).unwrap(),
                 NearToken::from_yoctonear(0),
                 Gas::from_tgas(10),
-            );
-            promise = Some(match promise {
-                None => call,
-                Some(prev) => prev.and(call),
-            });
+            ));
         }
-        promise.unwrap()
+        Self::fan_out(out).expect("1..=20 requests per call")
     }
 
     /// Founder or approver: reject waiting purchases; the team frees the reserved budget.
@@ -457,22 +486,19 @@ impl Contract {
         require!(env::attached_deposit() >= NearToken::from_yoctonear(1), "1 yocto");
         require!(!request_ids.is_empty() && request_ids.len() <= 20, "1..=20 requests per call");
         let approver = env::predecessor_account_id();
-        let mut promise: Option<Promise> = None;
+        let mut out = Vec::with_capacity(request_ids.len());
         for request_id in &request_ids {
             let p = self.pending_approvals.remove(request_id).expect("request is not waiting for approval");
             emit("purchase_rejected", json!({ "request_id": request_id, "approvers": [approver], "card_id": card_id, "reason": "rejected_by_approver" }));
-            let call = Promise::new(p.department).function_call(
-                "mark_rejected",
+            out.push((
+                p.department,
+                "mark_rejected".to_string(),
                 near_sdk::serde_json::to_vec(&json!({ "request_id": request_id })).unwrap(),
                 NearToken::from_yoctonear(0),
                 Gas::from_tgas(10),
-            );
-            promise = Some(match promise {
-                None => call,
-                Some(prev) => prev.and(call),
-            });
+            ));
         }
-        promise.unwrap()
+        Self::fan_out(out).expect("1..=20 requests per call")
     }
 
     pub fn get_pending_approval(&self, request_id: String) -> Option<PendingApproval> {
@@ -622,22 +648,13 @@ impl Contract {
     }
 
     fn cascade(&self, method: &str) -> Option<Promise> {
-        let mut promise: Option<Promise> = None;
-        for name in self.department_names.iter() {
-            if let Some(dept) = self.departments.get(name) {
-                let p = Promise::new(dept.clone()).function_call(
-                    method.to_string(),
-                    b"{}".to_vec(),
-                    NearToken::from_yoctonear(1),
-                    Gas::from_tgas(10),
-                );
-                promise = Some(match promise {
-                    None => p,
-                    Some(prev) => prev.and(p),
-                });
-            }
-        }
-        promise
+        let calls = self
+            .department_names
+            .iter()
+            .filter_map(|name| self.departments.get(name))
+            .map(|dept| (dept.clone(), method.to_string(), b"{}".to_vec(), NearToken::from_yoctonear(1), Gas::from_tgas(10)))
+            .collect();
+        Self::fan_out(calls)
     }
 
     #[payable]
@@ -756,6 +773,22 @@ mod tests {
     fn with_build_dept(c: &mut Contract) {
         ctx("founder.testnet", 4_500_000_000_000_000_000_000_000, 1_000);
         let _ = c.create_department("build".into(), "100".into(), "10".into(), None);
+    }
+
+    #[test]
+    fn dept_call_batches_one_team_into_one_receipt() {
+        // Regression: returning a joint promise fails on chain ("Returning joint promise is currently prohibited").
+        let mut c = company();
+        with_build_dept(&mut c);
+        c.departments.insert("build".into(), acc("build.acme.builderos-wang.testnet"));
+        ctx("founder.testnet", 5, 1_000);
+        let calls = (0..5)
+            .map(|i| DeptCall { department: "build".into(), method: "assign_task".into(), args: json!({ "task_id": format!("t{i}") }) })
+            .collect();
+        let _ = c.dept_call(calls);
+        let receipts = near_sdk::test_utils::get_created_receipts();
+        assert_eq!(receipts.len(), 1, "one batched receipt, no joint promise");
+        assert_eq!(receipts[0].actions.len(), 5);
     }
 
     #[test]

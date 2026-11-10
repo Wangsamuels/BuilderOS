@@ -75,3 +75,22 @@ describe("live stream only shows what the founder granted", () => {
     expect(visible(admin, ev("payment_signed", "ops.acme.t"))).toBe(true);
   });
 });
+
+describe("legacy company batching (joint promise)", () => {
+  const co = "acme.builderos-wang.testnet";
+  const calls = Array.from({ length: 5 }, (_, i) => tx.assignTaskCall(`build.${co}`, { taskId: `t${i}`, tier: "standard", cap: "1", tag: "backend", agentRole: "backend", dependsOn: [] }));
+  it("sends one dept_call per tx when perTx = 1", () => {
+    const txs = tx.deptCalls(co, calls, 1);
+    expect(txs).toHaveLength(5);
+    for (const t of txs) {
+      expect(t.actions[0].params.deposit).toBe("1");
+      expect((t.actions[0].params.args as any).calls).toHaveLength(1);
+    }
+  });
+  it("batches up to 12 on current code", () => {
+    expect(tx.deptCalls(co, calls)).toHaveLength(1);
+  });
+  it("splits approvals one per tx on legacy code", () => {
+    expect(tx.approve(co, ["a", "b", "c"], "card", 1)).toHaveLength(3);
+  });
+});
