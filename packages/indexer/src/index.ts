@@ -53,8 +53,10 @@ export async function runIndexer(opts: IndexerOptions, signal?: AbortSignal) {
   const db = getDb();
   let last = await lastHeight(db);
   // The block archive answers one request per block, so it can go much wider than raw RPC.
-  const batch = opts.batch ?? Number(process.env.INDEXER_BATCH ?? (neardataUrl() ? 100 : 40));
-  const concurrency = Number(process.env.INDEXER_CONCURRENCY ?? 8); // the free archive answers 429 above ~10 in flight
+  // Gentle by default: the free archive throttles shared IPs (Heroku). Steady state needs ~2 blocks/s.
+  const batch = opts.batch ?? Number(process.env.INDEXER_BATCH ?? (neardataUrl() ? 30 : 40));
+  const concurrency = Number(process.env.INDEXER_CONCURRENCY ?? 2);
+  let throttled = 0; // consecutive loops that failed with HTTP 429
   log.info({ from: last, batch, concurrency, source: neardataUrl() ?? "rpc" }, "indexer starting");
   const failures = new Map<string, number>();
 
@@ -67,11 +69,15 @@ export async function runIndexer(opts: IndexerOptions, signal?: AbortSignal) {
       const head = archiveHead ?? ((await finalBlock()).header.height as number);
       // Far behind: catch up from the transaction index (only BuilderOS accounts), then jump to the head.
       const threshold = Number(process.env.INDEXER_BACKFILL_THRESHOLD ?? 2_000);
-      if (txIndexUrl() && head - last > threshold) {
+      // Also when the archive keeps throttling us: the tx index covers the gap for BuilderOS accounts only.
+      if (txIndexUrl() && head > last && (head - last > threshold || throttled >= 2)) {
         try {
-          const txs = await collectBuilderOsTxs(last, head, log);
+          // Start a little earlier so callbacks of transactions sent just before `last` are covered (replays are no-ops).
+          const txs = await collectBuilderOsTxs(Math.max(0, last - 120), head, log);
           for (const t of txs) await processTx(t.hash, t.signer, t.height, t.status, opts);
-          log.info({ from: last, to: head, txs: txs.length }, "tx-index backfill done");
+          log.info({ from: last, to: head, txs: txs.length, reason: throttled >= 2 ? "archive_throttled" : "far_behind" }, "tx-index backfill done");
+          if (throttled >= 2) await sleep(5_000); // poll the tx index gently while the archive cools down
+          throttled = Math.max(0, throttled - 1);
           last = head;
           await db
             .insert(indexerState)
@@ -111,9 +117,12 @@ export async function runIndexer(opts: IndexerOptions, signal?: AbortSignal) {
         .insert(indexerState)
         .values({ id: "near", lastBlockHeight: last })
         .onConflictDoUpdate({ target: indexerState.id, set: { lastBlockHeight: last, updatedAt: new Date() } });
+      throttled = 0;
       if (head - last > 50) log.warn({ lag: head - last }, "indexer behind");
     } catch (e: any) {
-      log.error({ err: e?.message }, "indexer loop error");
+      if (String(e?.message).includes("429")) throttled++;
+      else throttled = 0;
+      log.error({ err: e?.message, throttled }, "indexer loop error");
       await sleep(3000);
     }
   }
@@ -193,7 +202,7 @@ export async function fetchBlock(height: number): Promise<BlockTx[]> {
   // No per-block RPC fallback: the RPC path finds only transactions *submitted* in this block, so it would
   // miss callbacks of earlier ones. Retry the archive; if it keeps failing the batch is retried later.
   let err: unknown;
-  for (let i = 0; i < 6; i++) {
+  for (let i = 0; i < 3; i++) {
     try {
       return await fetchBlockNeardata(height, base);
     } catch (e: any) {
