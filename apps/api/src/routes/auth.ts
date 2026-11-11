@@ -12,7 +12,7 @@ import {
   views,
   yoctoToNear,
 } from "@builderos/near";
-import { COOKIE, cookieOptions, issueSession, requireAccount, visibleCompanies } from "../auth.js";
+import { COOKIE, cookieOptions, issueSession, requireAccount, visibleCompanies, companiesFor } from "../auth.js";
 import { originAllowed, parse } from "../app.js";
 
 /** Accounts that must never be used as the testnet sponsor (their NEAR backs storage + refunds). */
@@ -113,7 +113,8 @@ export const authRoutes: FastifyPluginAsync = async (app) => {
    * Sign-in alone creates the account — Describe is not part of auth.
    */
   async function buildSetup(account: string) {
-    const companies = await visibleCompanies(account);
+    const memberships = await companiesFor(account); // each one re-checked on chain
+    const companies = memberships.map((m) => m.companyId);
     const funding = companyCreateFunding(3);
     const bal = await viewAccount(account).catch(() => ({
       exists: false,
@@ -150,7 +151,10 @@ export const authRoutes: FastifyPluginAsync = async (app) => {
 
     return {
       accountId: account,
-      companies,
+      /** Companies this account can open: { companyId, slug, name, isFounder, admin, scopes, departmentId }. */
+      companies: memberships,
+      /** Same list as plain ids (older clients). */
+      companyIds: companies,
       balance: {
         exists: bal.exists,
         availableYocto: bal.availableYocto,

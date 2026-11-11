@@ -90,9 +90,14 @@ export async function plan(description: string, tier: Tier) {
     }
   }
   features ??= heuristicPlan(description);
+  return { features, estimate: planEstimate(features, tier) };
+}
+
+/** Plan totals (micro-USDC strings) from its features; reused when a draft plan is edited. */
+export function planEstimate(features: PlanFeature[], tier: Tier) {
   const perFeature = features.map((f) => ({ key: f.key, ...estimate(f.tag, f.size, tier) }));
   const sum = (k: "p50" | "p90" | "cap") => perFeature.reduce((a, f) => a + BigInt(f[k]), 0n).toString();
-  return { features, estimate: { tier, p50: sum("p50"), p90: sum("p90"), cap: sum("cap"), perFeature } };
+  return { tier, p50: sum("p50"), p90: sum("p90"), cap: sum("cap"), perFeature };
 }
 
 /** Kahn topological sort; throws on cycles so a bad plan can't deadlock the queue. */

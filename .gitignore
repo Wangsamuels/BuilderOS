@@ -24,3 +24,6 @@ Claude outputs/
 .pnpm-store/
 .cargo-home/
 contracts/target/
+
+# e2e run output (tests/e2e/live.mts)
+e2e-evidence*.json

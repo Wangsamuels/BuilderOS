@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { DecideApprovalBody, FreezeBody, HttpError, LedgerQuery, MONEY_RECEIPT_KINDS, TempoFloatBody, WithdrawalBody, toBig, type UnsignedTx } from "@builderos/shared";
 import { and, approvalCards, departments, desc, eq, getDb, inArray, keyAccessLog, lt, railFloats, receipts, sql } from "@builderos/db";
 import { batchLimits, tx, view, views } from "@builderos/near";
+import { requireZeroDepositForwarding } from "./extra.js";
 import { authorize, departmentScope, requireAccount, requireFounder } from "../auth.js";
 import { parse } from "../app.js";
 
@@ -47,6 +48,7 @@ export const moneyRoutes: FastifyPluginAsync = async (app) => {
       // Allow-listing changes team policy: founder/admin only.
       if (!p.department_id || !p.seller_id || !p.pay_to) throw new HttpError(400, "this card has no seller to allow-list", "invalid_request");
       await authorize(account, card.companyId, ["admin"]);
+      await requireZeroDepositForwarding(card.companyId, "\"Always allow this seller\"");
       transactions.push(tx.allowSeller(p.department_id, p.seller_id, p.pay_to));
     }
     return { card, transaction: transactions[0], transactions };

@@ -26,10 +26,25 @@ export function createLogger(service: string) {
 }
 export type Logger = ReturnType<typeof createLogger>;
 
+/** Default machine-readable code per HTTP status, used when a route doesn't name a more specific one. */
+export const DEFAULT_ERROR_CODES: Record<number, string> = {
+  400: "invalid_request",
+  401: "unauthenticated",
+  402: "insufficient_funds",
+  403: "forbidden",
+  404: "not_found",
+  409: "conflict",
+  429: "rate_limited",
+  501: "not_implemented",
+  503: "unavailable",
+};
+
 export class HttpError extends Error {
   details?: unknown;
-  constructor(public status: number, message: string, public code = "error", details?: unknown) {
+  public code: string;
+  constructor(public status: number, message: string, code?: string, details?: unknown) {
     super(message);
+    this.code = code ?? DEFAULT_ERROR_CODES[status] ?? "error";
     this.details = details;
   }
 }

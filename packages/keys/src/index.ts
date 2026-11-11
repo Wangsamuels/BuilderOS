@@ -38,14 +38,21 @@ export async function uploadWrapped(p: {
   keys: Array<{ memberAccount: string; ciphertext: string }>;
 }) {
   if (!(await isFounder(p.companyId, p.caller))) {
-    if (p.kind === "code") throw new HttpError(403, "only the founder can upload code keys");
+    if (p.kind === "code") throw new HttpError(403, "only the founder can upload code keys", "forbidden");
     // Grants live on the company contract; a team-limited grant only covers its own team.
     const g = teamGrant(await views.getGrant(p.companyId, p.caller).catch(() => null), p.companyId, p.departmentId);
-    if (grantAllows(g, "code")) throw new HttpError(403, "not allowed");
+    if (grantAllows(g, "code")) throw new HttpError(403, "not allowed", "forbidden");
   }
   if (p.kind === "code") {
-    const company = await views.getCompany(p.companyId);
-    if (!company || company.code_key_version !== p.version) throw new HttpError(409, `contract has code key version ${company?.code_key_version}, not ${p.version}`);
+    // A rotate signed a moment ago may not be final yet: wait up to ~8 s for the contract to show it.
+    let onChain: number | undefined;
+    for (let i = 0; i < 5; i++) {
+      onChain = (await views.getCompany(p.companyId).catch(() => null))?.code_key_version;
+      if (onChain === p.version || (onChain !== undefined && onChain > p.version)) break;
+      await new Promise((r) => setTimeout(r, 2000));
+    }
+    if (onChain !== p.version)
+      throw new HttpError(409, `contract has code key version ${onChain}, not ${p.version}`, "version_conflict", { currentVersion: onChain ?? null, requested: p.version });
   }
   const db = getDb();
   for (const k of p.keys) {
@@ -88,7 +95,7 @@ export async function releaseWrapped(p: { caller: string; companyId: string; kin
     .orderBy(sql`${wrappedKeys.version} desc`)
     .limit(1);
   await logAccess(p.caller, p.companyId, p.kind, !!rows[0], rows[0] ? undefined : "no wrapped key");
-  if (!rows[0]) throw new HttpError(404, "no wrapped key for this account");
+  if (!rows[0]) throw new HttpError(404, "no wrapped key for this account", "not_found");
   return { version: rows[0].version, ciphertext: rows[0].ciphertext };
 }
 

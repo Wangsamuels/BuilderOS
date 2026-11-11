@@ -426,6 +426,7 @@ impl Contract {
 
     /// Company-only (founder/admin via dept_call): allow-list a seller and the only address it may be paid at.
     /// `pay_to: null` removes it. Purchases from sellers not on the list need a person's approval.
+    #[payable]
     pub fn allow_seller(&mut self, seller_id: String, pay_to: Option<String>) {
         self.assert_company();
         match pay_to {
@@ -443,6 +444,7 @@ impl Contract {
 
     /// Company-only (founder/admin via dept_call): Base chain, USDC contract and this team's
     /// Chain Signatures address (derived from this account + MPC_PATH).
+    #[payable]
     pub fn set_evm_config(&mut self, chain_id: u64, usdc: String, from: String) {
         self.assert_company();
         parse_address(&usdc);
@@ -970,6 +972,7 @@ impl Contract {
         Promise::new(env::current_account_id()).deploy_contract(code)
     }
 
+    #[payable]
     pub fn top_up_budget(&mut self, amount: String) {
         self.assert_company();
         self.budget = self.budget.saturating_add(parse_u128(&amount));

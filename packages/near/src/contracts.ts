@@ -18,6 +18,16 @@ function call(receiverId: string, methodName: string, args: Record<string, unkno
 
 // Account naming: <slug>.<factory> for a company, <dept>.<company> for a department.
 export const companyAccount = (slug: string) => `${slug}.${network().factory}`;
+/**
+ * One spelling for a company everywhere: "demo", "DEMO" and "demo.<factory>" all become "demo.<factory>".
+ * Anything that already has a dot (a full account id) is only lower-cased.
+ */
+export function normalizeCompanyId(v: string): string {
+  const s = String(v ?? "").trim().toLowerCase();
+  return /^[a-z0-9-]{2,32}$/.test(s) ? companyAccount(s) : s;
+}
+/** "demo.<factory>" → "demo" (the short form used in web URLs). */
+export const companySlug = (companyId: string) => companyId.replace(new RegExp(`\\.${network().factory.replace(/\./g, "\\.")}$`), "");
 export const departmentAccount = (companyId: string, dept: string) => `${dept}.${companyId}`;
 /** `build.acme.factory` → { name: "build", companyId: "acme.factory" } */
 export function splitDepartment(departmentId: string) {
@@ -284,9 +294,19 @@ async function companyVersion(companyId: string): Promise<number> {
 }
 /** How many calls one tx may carry for this company (1 on legacy code, see deptCalls). */
 export async function batchLimits(companyId: string) {
-  const ok = (await companyVersion(companyId)) >= 2;
-  return { legacy: !ok, deptCallsPerTx: ok ? DEPT_CALLS_PER_TX : 1, approvalsPerTx: ok ? APPROVALS_PER_TX : 1 };
+  const version = await companyVersion(companyId);
+  const ok = version >= 2;
+  return {
+    version,
+    legacy: !ok,
+    deptCallsPerTx: ok ? DEPT_CALLS_PER_TX : 1,
+    approvalsPerTx: ok ? APPROVALS_PER_TX : 1,
+    /** allow_seller / set_evm_config / top_up_budget only work through dept_call from version 3. */
+    zeroDepositForwarding: version >= 3,
+  };
 }
+
+export { companyVersion };
 
 export const views = {
   getGrant: (target: string, account: string) => view<Grant | null>(target, "get_grant", { account_id: account }),
@@ -335,6 +355,6 @@ export type HireableAgentView = {
 
 /** Founder check, read from chain (never from cache). */
 export async function isFounder(companyId: string, account: string) {
-  const c = await views.getCompany(companyId).catch(() => null);
+  const c = await views.getCompany(normalizeCompanyId(companyId)).catch(() => null);
   return c?.founder === account;
 }

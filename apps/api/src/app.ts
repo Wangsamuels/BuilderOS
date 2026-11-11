@@ -3,15 +3,17 @@ import cors from "@fastify/cors";
 import cookie from "@fastify/cookie";
 import rateLimit from "@fastify/rate-limit";
 import { z } from "zod";
-import { env, HttpError, type Logger } from "@builderos/shared";
+import { DEFAULT_ERROR_CODES, env, HttpError, type Logger } from "@builderos/shared";
 import { and, eq, getDb, idempotencyKeys } from "@builderos/db";
 import { loadSession } from "./auth.js";
+import { normalizeCompanyId } from "@builderos/near";
 import { SseHub } from "./sse.js";
 import { authRoutes } from "./routes/auth.js";
 import { coreRoutes } from "./routes/core.js";
 import { moneyRoutes } from "./routes/money.js";
 import { memberRoutes } from "./routes/members.js";
 import { streamRoutes } from "./routes/stream.js";
+import { extraRoutes } from "./routes/extra.js";
 
 export function parse<T extends z.ZodTypeAny>(schema: T, data: unknown): z.infer<T> {
   const r = schema.safeParse(data);
@@ -28,6 +30,9 @@ export function originAllowed(origin: string | undefined) {
   if (e.WEB_ORIGIN_PATTERN && new RegExp(e.WEB_ORIGIN_PATTERN).test(origin)) return true;
   return false;
 }
+
+/** Writes whose answer must be fresh every time (a replayed stream token would already be expired). */
+const NO_REPLAY = new Set(["/v1/stream/token", "/v1/auth/logout"]);
 
 export async function buildApp(opts: { log: Logger; hub?: SseHub }): Promise<FastifyInstance> {
   const app = Fastify({
@@ -50,6 +55,19 @@ export async function buildApp(opts: { log: Logger; hub?: SseHub }): Promise<Fas
   await app.register(cookie, { secret: env().SESSION_SECRET });
   app.addHook("onRequest", loadSession);
 
+  // One spelling per company: "demo" and "demo.<factory>" are the same company on every route
+  // (query/body companyId, and the :id of /v1/companies/:id/...). Authorization still runs per route.
+  app.addHook("preValidation", async (req) => {
+    const q = req.query as Record<string, unknown> | undefined;
+    if (q && typeof q.companyId === "string") q.companyId = normalizeCompanyId(q.companyId);
+    const b = req.body as Record<string, unknown> | undefined;
+    if (b && typeof b === "object" && !Array.isArray(b) && typeof b.companyId === "string") b.companyId = normalizeCompanyId(b.companyId);
+    const p = req.params as Record<string, unknown> | undefined;
+    const route = req.routeOptions.url ?? "";
+    if (p && typeof p.id === "string" && route.startsWith("/v1/companies/:id")) p.id = normalizeCompanyId(p.id);
+    if (p && typeof p.companyId === "string") p.companyId = normalizeCompanyId(p.companyId);
+  });
+
   // 60 writes/minute per account (per IP when signed out). Reads are not limited.
   await app.register(rateLimit, {
     hook: "preHandler",
@@ -62,7 +80,7 @@ export async function buildApp(opts: { log: Logger; hub?: SseHub }): Promise<Fas
   // Idempotency-Key on writes: replay the stored response for the same account + route + key.
   app.addHook("preHandler", async (req, reply) => {
     const key = req.headers["idempotency-key"];
-    if (!key || req.method === "GET" || !req.account) return;
+    if (!key || req.method === "GET" || !req.account || NO_REPLAY.has(req.routeOptions.url ?? "")) return;
     const [hit] = await getDb()
       .select()
       .from(idempotencyKeys)
@@ -74,7 +92,7 @@ export async function buildApp(opts: { log: Logger; hub?: SseHub }): Promise<Fas
   });
   app.addHook("onSend", async (req, reply, payload) => {
     const key = req.headers["idempotency-key"];
-    if (!key || req.method === "GET" || !req.account || reply.getHeader("idempotent-replay")) return payload;
+    if (!key || req.method === "GET" || !req.account || reply.getHeader("idempotent-replay") || NO_REPLAY.has(req.routeOptions.url ?? "")) return payload;
     if (reply.statusCode < 500 && typeof payload === "string") {
       try {
         await getDb()
@@ -88,10 +106,20 @@ export async function buildApp(opts: { log: Logger; hub?: SseHub }): Promise<Fas
     return payload;
   });
 
+  // Write responses: always offer `transactions` (array, sign in order). Single-tx routes keep `transaction`.
+  app.addHook("preSerialization", async (_req, _reply, payload: any) => {
+    if (payload && typeof payload === "object" && !Array.isArray(payload) && payload.transaction && !payload.transactions)
+      return { ...payload, transactions: [payload.transaction] };
+    return payload;
+  });
+
   app.setErrorHandler((err: any, req, reply) => {
     if (err instanceof HttpError)
       return reply.code(err.status).send({ error: err.code, code: err.code, message: err.message, ...(err.details ? { details: err.details } : {}) });
-    if (err.statusCode && err.statusCode < 500) return reply.code(err.statusCode).send({ error: err.code ?? "error", message: err.message });
+    if (err.statusCode && err.statusCode < 500) {
+      const code = err.statusCode === 429 ? "rate_limited" : DEFAULT_ERROR_CODES[err.statusCode] ?? "error";
+      return reply.code(err.statusCode).send({ error: code, code, message: err.message });
+    }
     req.log.error({ err: err.message, stack: err.stack }, "unhandled");
     return reply.code(500).send({ error: "internal", message: "Internal error" });
   });
@@ -103,6 +131,7 @@ export async function buildApp(opts: { log: Logger; hub?: SseHub }): Promise<Fas
   await app.register(moneyRoutes, { prefix: "/v1" });
   await app.register(memberRoutes, { prefix: "/v1" });
   await app.register(streamRoutes, { prefix: "/v1" });
+  await app.register(extraRoutes, { prefix: "/v1" });
   return app;
 }
 

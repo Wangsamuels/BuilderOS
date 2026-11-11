@@ -1,6 +1,6 @@
 import { createLogger, env, network } from "@builderos/shared";
 import { QUEUES, closeDb, companies, eq, getBoss, getDb, invites, sql, tasks } from "@builderos/db";
-import { runIndexer, type IndexedEvent } from "@builderos/indexer";
+import { runIndexer, sweepTeamDeposits, type IndexedEvent } from "@builderos/indexer";
 import { readyTasks, markQueued, resumeForRequest, runTask } from "@builderos/orchestrator";
 import { runTopup, runWithdrawal, scanFloats } from "@builderos/bridge";
 import { alertFor, notify, type Alert } from "@builderos/notify";
@@ -120,6 +120,11 @@ async function main() {
       const jobId = `topup:${departmentId}:${Date.now()}`;
       await boss.send(QUEUES.bridgeTopup, { jobId, departmentId, amount: amount.toString() }, { ...retry, singletonKey: `topup:${departmentId}` });
     });
+  });
+
+  // Team Base USDC addresses: money arriving there → deposit_received (the NEAR indexer can't see Base).
+  every(Number(process.env.DEPOSIT_SWEEP_MS ?? 60_000), async () => {
+    await sweepTeamDeposits(log);
   });
 
   log.info({ network: network().id, factory: network().factory }, "workers started");

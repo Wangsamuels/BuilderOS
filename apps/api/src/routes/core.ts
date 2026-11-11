@@ -15,12 +15,13 @@ import {
   type UnsignedTx,
 } from "@builderos/shared";
 import { agents, and, companies, departments, desc, eq, getDb, hires, inArray, plans, sellerOptions, tasks } from "@builderos/db";
-import { batchLimits, companyAccount, companyCreateFunding, departmentAccount, teamEvmConfig, tx, viewAccount, views, yoctoToNear } from "@builderos/near";
+import { batchLimits, companyAccount, companySlug, companyCreateFunding, departmentAccount, teamEvmConfig, tx, viewAccount, views, yoctoToNear } from "@builderos/near";
 import { estimate, type Tier } from "@builderos/router";
 import { listHireableAgents, nicheNecessity, HIRE_NECESSITY_MIN, plan as runPlanner, rankHireCandidates, ROLE_FOR_TAG, topoOrder } from "@builderos/orchestrator";
 import { parseChallenges, challengeAmount } from "@builderos/rails";
 import { seal, serialize, serverKey } from "@builderos/crypto";
-import { authorize, departmentScope, requireAccount, requireFounder, visibleCompanies, type Access } from "../auth.js";
+import { requireZeroDepositForwarding } from "./extra.js";
+import { authorize, companiesFor, departmentScope, linkCompany, requireAccount, requireFounder, visibleCompanies, type Access } from "../auth.js";
 import { parse } from "../app.js";
 
 const DEPT_FOR_TAG: Record<string, string> = { growth: "growth", support: "growth", devops: "ops" };
@@ -29,23 +30,39 @@ export const coreRoutes: FastifyPluginAsync = async (app) => {
   // ---------- companies ----------
   app.get("/companies", async (req) => {
     const account = requireAccount(req);
-    const ids = await visibleCompanies(account);
-    if (!ids.length) return { companies: [] };
-    const rows = await getDb().select().from(companies).where(inArray(companies.id, ids));
-    return { companies: rows };
+    const list = await companiesFor(account); // re-checked on chain
+    if (!list.length) return { companies: [] };
+    const rows = await getDb().select().from(companies).where(inArray(companies.id, list.map((c) => c.companyId)));
+    const byId = new Map(rows.map((r) => [r.id, r]));
+    return {
+      companies: list.map((m) => ({ ...(byId.get(m.companyId) ?? { id: m.companyId, accountId: m.companyId, name: m.name }), ...m })),
+    };
   });
 
   app.get<{ Params: { id: string } }>("/companies/:id", async (req) => {
     const account = requireAccount(req);
     const access = await authorize(account, req.params.id, ["view", "approve", "builder", "code"]);
     const db = getDb();
-    const [c] = await db.select().from(companies).where(eq(companies.id, req.params.id));
+    let [c] = await db.select().from(companies).where(eq(companies.id, req.params.id));
+    if (!c) {
+      // Indexer hasn't saved it yet: the chain already confirmed access, so cache company + teams now.
+      await syncCompanyFromChain(req.params.id).catch(() => false);
+      [c] = await db.select().from(companies).where(eq(companies.id, req.params.id));
+    }
+    await linkCompany(account, req.params.id, "read");
     const allowed = departmentScope(access);
     const depts = (await db.select().from(departments).where(eq(departments.companyId, req.params.id))).filter(
       (d) => !allowed || allowed.includes(d.id),
     );
     const onChain = await views.getCompany(req.params.id).catch(() => null); // budget is read from chain
-    return { company: c ?? null, departments: depts, chain: onChain, access: accessSummary(access) };
+    return {
+      company: c ?? { id: req.params.id, accountId: req.params.id, name: onChain?.name ?? null, founderAccount: onChain?.founder ?? null },
+      companyId: req.params.id,
+      slug: companySlug(req.params.id),
+      departments: depts,
+      chain: onChain,
+      access: accessSummary(access),
+    };
   });
 
   /**
@@ -62,6 +79,7 @@ export const coreRoutes: FastifyPluginAsync = async (app) => {
       if (departmentAccount(companyId, d.name).length > 64) throw new HttpError(400, `"${d.name}" + slug is too long for a NEAR account id`, "invalid_request");
 
     const state = await creationState(body.slug, account);
+    if (!state.slugTaken || state.founderIsYou) await linkCompany(account, companyId, "create");
     if (state.slugTaken && !state.founderIsYou) throw new HttpError(409, `"${body.slug}" is taken — pick another company name`, "slug_taken");
     if (state.slugTaken && !state.companyExists)
       throw new HttpError(409, "This company is still being created on chain. Check again in a few seconds.", "create_in_progress");
@@ -114,6 +132,7 @@ export const coreRoutes: FastifyPluginAsync = async (app) => {
     if (!/^[a-z0-9-]{2,32}$/.test(slug)) throw new HttpError(400, "invalid slug", "invalid_request");
     const st = await creationState(slug, account);
     if (st.slugTaken && !st.founderIsYou) return { slug, slugTaken: true, founderIsYou: false };
+    if (st.founderIsYou && st.companyExists) await linkCompany(account, st.companyId, "creation");
     return st;
   });
 
@@ -357,6 +376,7 @@ export const coreRoutes: FastifyPluginAsync = async (app) => {
     await authorize(account, req.params.id, ["admin"]);
     const teams = await views.getDepartments(req.params.id).catch(() => []);
     if (!teams.length) throw new HttpError(409, "company has no teams on chain yet", "no_teams");
+    await requireZeroDepositForwarding(req.params.id, "payment setup");
     const transactions = await Promise.all(teams.map(async (d) => tx.setEvmConfig(d.department_id, await teamEvmConfig(d.department_id))));
     return { transactions };
   });
@@ -367,6 +387,7 @@ export const coreRoutes: FastifyPluginAsync = async (app) => {
     const body = parse(AllowSellerBody, req.body);
     if (!body.departmentId.endsWith(`.${body.companyId}`)) throw new HttpError(400, "departmentId is not a team of companyId", "invalid_request");
     await authorize(account, body.companyId, ["admin"]);
+    await requireZeroDepositForwarding(body.companyId, "the seller allow-list");
     return { transaction: tx.allowSeller(body.departmentId, body.sellerId, body.payTo) };
   });
 

@@ -2,10 +2,10 @@ import type { FastifyPluginAsync } from "fastify";
 import { z } from "zod";
 import { HttpError, InviteBody, PushSubscriptionBody, env } from "@builderos/shared";
 import { accountEmails, and, desc, eq, getDb, invites, notifications, pushSubscriptions } from "@builderos/db";
-import { tx } from "@builderos/near";
+import { tx, views } from "@builderos/near";
 import { releaseWrapped, uploadWrapped } from "@builderos/keys";
 import { hmacHex, randomToken, seal, serialize, serverKey, sha256Hex } from "@builderos/crypto";
-import { authorize, requireAccount, requireFounder } from "../auth.js";
+import { authorize, linkCompany, requireAccount, requireFounder } from "../auth.js";
 import { parse } from "../app.js";
 
 const SCOPES: Record<string, string[]> = {
@@ -48,10 +48,12 @@ export const memberRoutes: FastifyPluginAsync = async (app) => {
 
   /** Invitee (signed in with their own NEAR account) accepts → accept_invite transaction. */
   app.post("/invites/accept", async (req) => {
-    requireAccount(req);
+    const account = requireAccount(req);
     const { code } = parse(z.object({ code: z.string().min(10) }), req.body);
     const [inv] = await getDb().select().from(invites).where(eq(invites.codeHash, sha256Hex(code)));
     if (!inv || inv.expiresAt < new Date() || inv.status === "revoked") throw new HttpError(404, "invite not found or expired");
+    // Hint only: /auth/me lists the company once the accept_invite grant is live on chain.
+    await linkCompany(account, inv.companyId, "invite");
     return { companyId: inv.companyId, transaction: tx.acceptInvite(inv.companyId, code) };
   });
 
@@ -80,10 +82,20 @@ export const memberRoutes: FastifyPluginAsync = async (app) => {
   // ---------- keys ----------
   app.post("/keys/code/rotate", async (req) => {
     const account = requireAccount(req);
-    const body = parse(z.object({ companyId: z.string(), newVersion: z.number().int().positive() }), req.body);
+    const body = parse(z.object({ companyId: z.string(), newVersion: z.number().int().positive().optional() }), req.body);
     await requireFounder(account, body.companyId);
-    // After this tx lands, upload the new wrapped keys with POST /v1/keys/wrapped (version must match the contract).
-    return { transaction: tx.rotateCodeKey(body.companyId, body.newVersion), next: "POST /v1/keys/wrapped" };
+    const current = (await views.getCompany(body.companyId).catch(() => null))?.code_key_version ?? 0;
+    const newVersion = body.newVersion ?? current + 1;
+    if (newVersion <= current) throw new HttpError(409, `newVersion must be above the current version ${current}`, "version_conflict", { currentVersion: current });
+    return {
+      currentVersion: current,
+      newVersion,
+      transaction: { ...tx.rotateCodeKey(body.companyId, newVersion), signerId: account },
+      // Order: 1) sign this tx  2) GET /v1/keys/devices?companyId=&kind=code  3) wrap the new key to each
+      // device in the browser  4) POST /v1/keys/wrapped { kind:"code", version:newVersion, keys:[...] }
+      // (refused with 409 until the contract shows newVersion).
+      next: ["sign transaction", "GET /v1/keys/devices?companyId=&kind=code", "POST /v1/keys/wrapped"],
+    };
   });
 
   app.post("/keys/wrapped", async (req) => {
@@ -110,9 +122,10 @@ export const memberRoutes: FastifyPluginAsync = async (app) => {
 
   /** Register the x25519 view key on chain (keys are wrapped to it). */
   app.post("/keys/view", async (req) => {
-    requireAccount(req);
-    const body = parse(z.object({ companyId: z.string(), x25519PublicKey: z.string() }), req.body);
-    return { transaction: tx.registerViewKey(body.companyId, body.x25519PublicKey) };
+    const account = requireAccount(req);
+    const body = parse(z.object({ companyId: z.string(), x25519PublicKey: z.string().min(40).max(60) }), req.body);
+    // Then POST /v1/keys/view/confirm { companyId, txHash } so the founder can wrap keys to it right away.
+    return { transaction: { ...tx.registerViewKey(body.companyId, body.x25519PublicKey), signerId: account }, next: "POST /v1/keys/view/confirm" };
   });
 
   // ---------- notifications ----------

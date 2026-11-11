@@ -28,3 +28,17 @@ export async function teamEvmConfig(departmentAccount: string): Promise<EvmConfi
   const n = network();
   return { chain_id: n.base.chainId, usdc: n.base.usdc, from: await teamPaymentAddress(departmentAccount) };
 }
+
+/** ERC-20 balanceOf on Base (atomic units; USDC = micro-USDC). Plain JSON-RPC, no wallet library. */
+export async function baseUsdcBalance(holder: string, token = network().base.usdc): Promise<string> {
+  const data = `0x70a08231${holder.toLowerCase().replace(/^0x/, "").padStart(64, "0")}`;
+  const res = await fetch(network().base.rpcUrl, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_call", params: [{ to: token, data }, "latest"] }),
+    signal: AbortSignal.timeout(10_000),
+  });
+  const j: any = await res.json();
+  if (j.error || typeof j.result !== "string") throw new Error(`base balanceOf failed: ${j.error?.message ?? "no result"}`);
+  return BigInt(j.result === "0x" ? 0 : j.result).toString();
+}

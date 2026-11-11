@@ -16,10 +16,13 @@ import {
   sql,
   type DB,
 } from "@builderos/db";
-import { blockAt, chunk, finalBlock, parseEventLog, txStatus } from "@builderos/near";
+import { blockAt, chunk, finalBlock, parseEventLog, txStatus, views } from "@builderos/near";
 import { buildReceipt, scopeOf } from "./receipts.js";
 
 export * from "./receipts.js";
+export * from "./deposits.js";
+export * from "./backfill.js";
+import { collectBuilderOsTxs, txIndexUrl } from "./backfill.js";
 
 export type IndexedEvent = {
   id: number;
@@ -49,12 +52,35 @@ export async function runIndexer(opts: IndexerOptions, signal?: AbortSignal) {
   const { log } = opts;
   const db = getDb();
   let last = await lastHeight(db);
-  const batch = opts.batch ?? Number(process.env.INDEXER_BATCH ?? 40);
-  log.info({ from: last, batch }, "indexer starting");
+  // The block archive answers one request per block, so it can go much wider than raw RPC.
+  const batch = opts.batch ?? Number(process.env.INDEXER_BATCH ?? (neardataUrl() ? 100 : 40));
+  const concurrency = Number(process.env.INDEXER_CONCURRENCY ?? 8); // the free archive answers 429 above ~10 in flight
+  log.info({ from: last, batch, concurrency, source: neardataUrl() ?? "rpc" }, "indexer starting");
+  const failures = new Map<string, number>();
 
   while (!signal?.aborted) {
     try {
-      const head = (await finalBlock()).header.height as number;
+      // Never read past what the archive has: a height it doesn't have yet is not an empty block.
+      const rpcHead = (await finalBlock()).header.height as number;
+      const archiveHead = neardataUrl() ? await archiveFinalHeight().catch(() => null) : null;
+      const head = archiveHead ? Math.min(rpcHead, archiveHead) : rpcHead;
+      // Far behind: catch up from the transaction index (only BuilderOS accounts), then jump to the head.
+      const threshold = Number(process.env.INDEXER_BACKFILL_THRESHOLD ?? 20_000);
+      if (txIndexUrl() && head - last > threshold) {
+        try {
+          const txs = await collectBuilderOsTxs(last, head, log);
+          for (const t of txs) await processTx(t.hash, t.signer, t.height, t.status, opts);
+          log.info({ from: last, to: head, txs: txs.length }, "tx-index backfill done");
+          last = head;
+          await db
+            .insert(indexerState)
+            .values({ id: "near", lastBlockHeight: last })
+            .onConflictDoUpdate({ target: indexerState.id, set: { lastBlockHeight: last, updatedAt: new Date() } });
+          continue;
+        } catch (e: any) {
+          log.error({ err: e?.message }, "tx-index backfill failed; scanning blocks instead");
+        }
+      }
       if (last >= head) {
         await sleep(opts.idleMs ?? 1000);
         continue;
@@ -62,9 +88,22 @@ export async function runIndexer(opts: IndexerOptions, signal?: AbortSignal) {
       const to = Math.min(head, last + batch);
       const heights = Array.from({ length: to - last }, (_, i) => last + 1 + i);
       // Fetch (RPC-bound) in parallel, then write strictly in block order so replay stays deterministic.
-      const fetched = await mapLimit(heights, Number(process.env.INDEXER_CONCURRENCY ?? 8), fetchBlockTxs);
+      const fetched = await mapLimit(heights, concurrency, fetchBlock);
       for (let i = 0; i < heights.length; i++) {
-        for (const t of fetched[i]) await processTx(t.hash, t.signer, heights[i], t.status, opts);
+        for (const t of fetched[i]) {
+          try {
+            await processTx(t.hash, t.signer, heights[i], t.status, opts);
+            failures.delete(t.hash);
+          } catch (e: any) {
+            // One bad transaction must never stall the indexer: after 5 tries, dead-letter it and move on.
+            const n = (failures.get(t.hash) ?? 0) + 1;
+            failures.set(t.hash, n);
+            if (n < 5) throw e;
+            failures.delete(t.hash);
+            log.error({ tx: t.hash, height: heights[i], err: e?.message }, "skipping transaction after 5 failures");
+            await db.insert(deadLetters).values({ contract: "indexer", raw: JSON.stringify({ tx: t.hash, height: heights[i] }), error: String(e?.message ?? e).slice(0, 2000), blockHeight: heights[i], nearTx: t.hash });
+          }
+        }
         last = heights[i];
       }
       await db
@@ -103,6 +142,68 @@ async function lastHeight(db: DB) {
 
 type BlockTx = { hash: string; signer: string; status: any };
 
+/**
+ * FastNEAR block archive (neardata): one request returns the block with every receipt outcome and its
+ * logs, so catching up costs 1 request per block instead of block + chunks + tx_status per transaction.
+ * NEARDATA_URL="" turns it off (RPC only).
+ */
+export function neardataUrl(): string | null {
+  const v = process.env.NEARDATA_URL ?? (network().id === "mainnet" ? "https://mainnet.neardata.xyz" : "https://testnet.neardata.xyz");
+  return v ? v.replace(/\/$/, "") : null;
+}
+
+/** Receipts executed on BuilderOS accounts in this block, grouped per transaction (same shape processTx reads). */
+export async function fetchBlockNeardata(height: number, base: string): Promise<BlockTx[]> {
+  const key = process.env.NEARDATA_API_KEY; // optional FastNEAR key for higher rate limits
+  const res = await fetch(`${base}/v0/block/${height}${key ? `?apiKey=${encodeURIComponent(key)}` : ""}`, { signal: AbortSignal.timeout(20_000) });
+  if (res.status === 404) return []; // skipped height
+  if (!res.ok) throw new Error(`neardata ${res.status} at ${height}`);
+  const body: any = await res.json();
+  if (!body) return []; // skipped height (null body)
+  const byTx = new Map<string, BlockTx>();
+  for (const shard of body.shards ?? [])
+    for (const ro of shard.receipt_execution_outcomes ?? []) {
+      const o = ro.execution_outcome;
+      if (!isOurs(o?.outcome?.executor_id ?? "")) continue;
+      const hash: string = ro.tx_hash ?? o.id;
+      const signer: string = ro.receipt?.receipt?.Action?.signer_id ?? ro.receipt?.predecessor_id ?? "";
+      const t = byTx.get(hash) ?? { hash, signer, status: { receipts_outcome: [] as any[] } };
+      t.status.receipts_outcome.push({ id: o.id, outcome: o.outcome });
+      byTx.set(hash, t);
+    }
+  return [...byTx.values()];
+}
+
+/** Latest final height the archive serves. */
+export async function archiveFinalHeight(): Promise<number | null> {
+  const base = neardataUrl();
+  if (!base) return null;
+  const res = await fetch(`${base}/v0/last_block/final`, { signal: AbortSignal.timeout(10_000), redirect: "follow" });
+  if (!res.ok) return null;
+  const b: any = await res.json();
+  const h = Number(b?.block?.header?.height);
+  return Number.isFinite(h) ? h : null;
+}
+
+/** Archive first, raw RPC as fallback. */
+export async function fetchBlock(height: number): Promise<BlockTx[]> {
+  const base = neardataUrl();
+  if (!base) return fetchBlockTxs(height);
+  // No per-block RPC fallback: the RPC path finds only transactions *submitted* in this block, so it would
+  // miss callbacks of earlier ones. Retry the archive; if it keeps failing the batch is retried later.
+  let err: unknown;
+  for (let i = 0; i < 6; i++) {
+    try {
+      return await fetchBlockNeardata(height, base);
+    } catch (e: any) {
+      err = e;
+      const limited = String(e?.message).includes(" 429 ");
+      await sleep((limited ? 1500 : 400) * 2 ** i * (0.75 + Math.random() / 2)); // back off, with jitter
+    }
+  }
+  throw err;
+}
+
 /** Transactions in this block that touch BuilderOS accounts, with their final outcomes. */
 export async function fetchBlockTxs(height: number): Promise<BlockTx[]> {
   let block: any;
@@ -119,7 +220,7 @@ export async function fetchBlockTxs(height: number): Promise<BlockTx[]> {
 }
 
 export async function processBlock(height: number, opts: IndexerOptions) {
-  for (const t of await fetchBlockTxs(height)) await processTx(t.hash, t.signer, height, t.status, opts);
+  for (const t of await fetchBlock(height)) await processTx(t.hash, t.signer, height, t.status, opts);
 }
 
 /** Parse all logs of one transaction and persist. Idempotent on (receipt_id, log_index). */
@@ -199,12 +300,23 @@ async function applyToCaches(db: DB, event: EventName, d: Record<string, any>, c
         .values({ id: d.company_id, accountId: d.company_id, name: d.name, preset: d.preset, network: network().id, founderAccount: d.founder, ...chain })
         .onConflictDoNothing();
       break;
-    case "department_created":
+    case "department_created": {
+      // The company row normally comes from company_created; if that event was missed (e.g. a create whose
+      // factory callback failed), read the company from chain so the team row's foreign key holds.
+      const has = await db.execute(sql`select 1 from companies where id = ${d.company_id}`);
+      if (!has.rows.length) {
+        const co = await views.getCompany(d.company_id).catch(() => null);
+        await db
+          .insert(companies)
+          .values({ id: d.company_id, accountId: d.company_id, name: co?.name ?? null, network: network().id, founderAccount: co?.founder ?? "unknown", ...chain })
+          .onConflictDoNothing();
+      }
       await db
         .insert(departments)
         .values({ id: d.department_id, companyId: d.company_id, accountId: d.department_id, name: d.name, contractHash: d.contract_hash, baseAddress: d.base_address ?? null, ...chain })
         .onConflictDoNothing();
       break;
+    }
     case "agent_registered":
       await db
         .insert(agents)
@@ -239,7 +351,14 @@ async function applyToCaches(db: DB, event: EventName, d: Record<string, any>, c
       );
       break;
     case "view_key_registered":
-      await db.execute(sql`update members_cache set view_key = ${d.x25519_public_key} where account_id = ${d.account_id}`);
+      // Emitted by the company contract; the founder has no members_cache row, so keep keys in view_keys.
+      if (c.companyId)
+        await db.execute(sql`insert into view_keys (account_id, company_id, x25519_public_key, near_tx, block_height, updated_at)
+          values (${d.account_id}, ${c.companyId}, ${d.x25519_public_key}, ${c.txHash}, ${c.height}, now())
+          on conflict (account_id, company_id) do update set x25519_public_key = excluded.x25519_public_key,
+            near_tx = excluded.near_tx, block_height = excluded.block_height, updated_at = now()
+          where view_keys.block_height is null or view_keys.block_height <= excluded.block_height`);
+      await db.execute(sql`update members_cache set view_key = ${d.x25519_public_key} where account_id = ${d.account_id} and company_id = ${c.companyId}`);
       break;
     case "code_key_rotated":
       await db.execute(sql`update companies set code_key_version = ${d.version} where id = ${d.company_id}`);

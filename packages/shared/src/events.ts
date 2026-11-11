@@ -101,6 +101,16 @@ export const EventSchemas = {
   unfrozen: z.looseObject({ company_id: opt(z.string()), department_id: opt(z.string()) }),
 
   deposit: z.looseObject({ amount, token: z.string(), payer: opt(z.string()) }),
+  /** Off-chain watcher: a team's Base USDC address balance went up (amount = increase, micro-USDC). */
+  deposit_received: z.looseObject({
+    company_id: z.string(),
+    department_id: opt(z.string()),
+    address: z.string(),
+    chain_id: z.number(),
+    token: z.string(),
+    amount,
+    balance: amount,
+  }),
   revenue: z.looseObject({ amount, token: z.string(), payer: opt(z.string()), foreign_tx: opt(z.string()) }),
 } as const;
 

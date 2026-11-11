@@ -45,6 +45,10 @@ const DEPT_FORWARD_METHODS: &[&str] = &[
     "freeze", // pause one team; resuming goes through the company's founder-only `unfreeze`
 ];
 
+/// Team methods that take no deposit (not #[payable] on teams created before contract_version 3).
+/// Forwarding 1 yocto to them makes the team panic, so they get 0.
+const DEPT_ZERO_DEPOSIT_METHODS: &[&str] = &["allow_seller", "set_evm_config", "top_up_budget"];
+
 fn hex(bytes: &[u8]) -> String {
     const H: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -244,7 +248,8 @@ impl Contract {
             require!(DEPT_FORWARD_METHODS.contains(&c.method.as_str()), "method not allowed");
             let dept = self.departments.get(&c.department).cloned().expect("unknown department");
             let args = near_sdk::serde_json::to_vec(&c.args).expect("bad args");
-            out.push((dept, c.method, args, NearToken::from_yoctonear(1), Gas::from_tgas(15)));
+            let deposit = if DEPT_ZERO_DEPOSIT_METHODS.contains(&c.method.as_str()) { 0 } else { 1 };
+            out.push((dept, c.method, args, NearToken::from_yoctonear(deposit), Gas::from_tgas(15)));
         }
         Self::fan_out(out).expect("1..=12 calls")
     }
@@ -284,9 +289,11 @@ impl Contract {
         matches!(env::promise_result_checked(0, 16_384), Err(PromiseError::Failed))
     }
 
-    /// 2 = calls to several teams are batched safely (no joint promise returned). Older code has no such method.
+    /// 2 = calls to several teams are batched safely (no joint promise returned).
+    /// 3 = allow_seller / set_evm_config / top_up_budget are forwarded without a deposit (they work).
+    /// Older code has no such method.
     pub fn contract_version(&self) -> u32 {
-        2
+        3
     }
 
     pub fn get_company(&self) -> CompanyView {
@@ -789,6 +796,28 @@ mod tests {
         let receipts = near_sdk::test_utils::get_created_receipts();
         assert_eq!(receipts.len(), 1, "one batched receipt, no joint promise");
         assert_eq!(receipts[0].actions.len(), 5);
+    }
+
+    #[test]
+    fn dept_call_sends_no_deposit_to_non_payable_team_methods() {
+        let mut c = company();
+        with_build_dept(&mut c);
+        c.departments.insert("build".into(), acc("build.acme.builderos-wang.testnet"));
+        ctx("founder.testnet", 2, 1_000);
+        let _ = c.dept_call(vec![
+            DeptCall { department: "build".into(), method: "allow_seller".into(), args: json!({ "seller_id": "s", "pay_to": null }) },
+            DeptCall { department: "build".into(), method: "assign_task".into(), args: json!({ "task_id": "t" }) },
+        ]);
+        let r = near_sdk::test_utils::get_created_receipts();
+        let deposits: Vec<u128> = r[0]
+            .actions
+            .iter()
+            .map(|a| match a {
+                near_sdk::mock::MockAction::FunctionCallWeight { attached_deposit, .. } => attached_deposit.as_yoctonear(),
+                _ => 99,
+            })
+            .collect();
+        assert_eq!(deposits, vec![0, 1]);
     }
 
     #[test]

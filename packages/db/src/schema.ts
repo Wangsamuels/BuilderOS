@@ -500,3 +500,46 @@ export const testnetDrips = pgTable("testnet_drips", {
   ip: text("ip"),
   createdAt: created(),
 });
+
+/**
+ * Accounts known to belong to a company, written by the API the moment it learns it (create request,
+ * creation poll, company read, invite accept). Lets /auth/me list a company before the indexer catches
+ * up. Only a hint: every read still re-checks founder/grant on chain.
+ */
+export const companyLinks = pgTable(
+  "company_links",
+  {
+    accountId: text("account_id").notNull(),
+    companyId: text("company_id").notNull(),
+    source: text("source").notNull(), // create | creation | read | invite | backfill
+    createdAt: created(),
+  },
+  (t) => [primaryKey({ columns: [t.accountId, t.companyId] })],
+);
+
+/**
+ * Device view keys (x25519), one per account per company. `register_view_key` only emits an event (no
+ * on-chain state), so this is where the founder reads members' public keys to wrap a rotated code key.
+ * Written from the indexed event or from POST /v1/keys/view/confirm (tx checked on chain).
+ */
+export const viewKeys = pgTable(
+  "view_keys",
+  {
+    accountId: text("account_id").notNull(),
+    companyId: text("company_id").notNull(),
+    x25519PublicKey: text("x25519_public_key").notNull(),
+    nearTx: text("near_tx"),
+    blockHeight: bigint("block_height", { mode: "number" }),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (t) => [primaryKey({ columns: [t.accountId, t.companyId] })],
+);
+
+/** Last seen token balance of a watched address (team Base USDC addresses) → deposit_received events. */
+export const addressBalances = pgTable("address_balances", {
+  address: text("address").primaryKey(), // "<chainId>:<token>:<holder>" lowercase
+  companyId: text("company_id").notNull(),
+  departmentId: text("department_id"),
+  balance: amount("balance").notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+});

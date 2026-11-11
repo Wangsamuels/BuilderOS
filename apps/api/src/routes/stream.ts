@@ -3,12 +3,12 @@ import { HttpError } from "@builderos/shared";
 import { getDb, sql } from "@builderos/db";
 import { finalBlock } from "@builderos/near";
 import { originAllowed } from "../app.js";
-import { accessFor, requireAccount, visibleCompanies, type Access } from "../auth.js";
+import { accessFor, issueStreamToken, requireAccount, visibleCompanies, type Access } from "../auth.js";
 import type { StreamFilter } from "../sse.js";
 
 // Upgrade proposals are shown to every member: code can only change after a public 24h wait.
 const EVERYONE = ["company_created", "department_created", "frozen", "unfrozen", "upgrade_proposed", "upgrade_cancelled", "upgrade_applied"];
-const MONEY = ["payment_signed", "receipt", "purchase_requested", "purchase_yielded", "purchase_approved", "purchase_rejected", "topup_requested", "topup_recorded", "withdrawal_requested", "withdrawal_recorded", "float_set", "deposit", "revenue", "bounty_released", "bounty_voided"];
+const MONEY = ["payment_signed", "receipt", "purchase_requested", "purchase_yielded", "purchase_approved", "purchase_rejected", "topup_requested", "topup_recorded", "withdrawal_requested", "withdrawal_recorded", "float_set", "deposit", "deposit_received", "revenue", "bounty_released", "bounty_voided"];
 const BUILD = ["task_assigned", "agent_registered", "bounty_created", "agent_hired", "bounty_released", "bounty_voided"];
 
 /** Founder/admin see every event; members see only the event kinds their scopes cover, for their team. */
@@ -28,18 +28,15 @@ export const streamRoutes: FastifyPluginAsync = async (app) => {
    */
   app.get<{ Querystring: { companyId?: string; lastEventId?: string; token?: string } }>("/stream", async (req, reply) => {
     const account = requireAccount(req);
-    let companies = await visibleCompanies(account);
-    if (req.query.companyId) {
-      if (!companies.includes(req.query.companyId)) throw new HttpError(403, "not a member of this company");
-      companies = [req.query.companyId];
-    }
+    // With companyId: checked on chain below (works before the indexer has cached the company).
+    const companies = req.query.companyId ? [req.query.companyId] : await visibleCompanies(account);
     // Each company's events are filtered by what the founder granted this account (read live from chain).
     const filters = new Map<string, StreamFilter>();
     for (const c of companies) {
       const access = await accessFor(account, c).catch(() => null);
       if (access) filters.set(c, streamFilter(access));
     }
-    if (req.query.companyId && !filters.size) throw new HttpError(403, "no grant for this company", "forbidden");
+    if (req.query.companyId && !filters.size) throw new HttpError(403, "You don't have access to this company. Ask the founder for an invite.", "forbidden");
     const last = Number(req.headers["last-event-id"] ?? req.query.lastEventId ?? 0) || undefined;
 
     const origin = req.headers.origin;
@@ -53,9 +50,28 @@ export const streamRoutes: FastifyPluginAsync = async (app) => {
     reply.raw.write(`retry: 3000\n\n`);
     reply.hijack();
 
+    const expiresAt = req.sessionExpiresAt ?? null;
+    reply.raw.write(`event: ready\ndata: ${JSON.stringify({ account, companies: [...filters.keys()], resumedAfter: last ?? null, expiresAt })}\n\n`);
     const lag = await indexerLag().catch(() => null);
     if (lag != null && lag > 30) reply.raw.write(`event: status\ndata: ${JSON.stringify({ catchingUp: true, lag })}\n\n`);
+    // When the session/stream token expires: tell the client, then close. Reconnecting with the same
+    // token now gets 401 — fetch a new one (POST /v1/stream/token) or sign in again.
+    if (expiresAt) {
+      const ms = Math.max(0, expiresAt.getTime() - Date.now());
+      const t = setTimeout(() => {
+        reply.raw.write(`event: reauth\ndata: ${JSON.stringify({ reason: "token_expired", expiresAt })}\n\n`);
+        reply.raw.end();
+      }, Math.min(ms, 2_147_000_000));
+      reply.raw.on("close", () => clearTimeout(t));
+    }
     await app.hub.add(account, filters, reply, last);
+  });
+
+  /** Short-lived token for `GET /v1/stream?token=` (valid on the stream only, ≤15 min, never longer than the session). */
+  app.post("/stream/token", async (req) => {
+    const account = requireAccount(req);
+    const { token, expiresAt } = await issueStreamToken(account, req.sessionExpiresAt);
+    return { token, expiresAt, url: `/v1/stream?token=${encodeURIComponent(token)}` };
   });
 
   /** Small status panel: indexer lag, queue depth, failed jobs, bridge transfers in flight, Tempo/MPP rails. */

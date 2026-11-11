@@ -56,6 +56,17 @@ export function estimate(tag: string, size: string, tier: Tier) {
   return { tag, size, tier, p50: p50.toString(), p90: p90.toString(), cap: cap.toString(), models: pool.map((m) => m.id) };
 }
 
+/** Price one task on one specific model (its cheapest offer). Same p50/p90/cap rules as `estimate`. */
+export function estimateForModel(tag: string, size: string, modelId: string) {
+  const m = MODELS.find((x) => x.id === modelId);
+  if (!m) return null;
+  const t = SIZE_TOKENS[size] ?? SIZE_TOKENS.m;
+  const offers = m.offers.map((o) => ({ o, cost: offerCost(o, t.in * t.calls, t.out * t.calls) })).sort((a, b) => (a.cost < b.cost ? -1 : 1));
+  const p50 = offers[0]?.cost ?? 0n;
+  const p90 = (p50 * 18n) / 10n;
+  return { tag, size, model: m.id, tiers: m.tiers, rail: offers[0]?.o.rail ?? null, p50: p50.toString(), p90: p90.toString(), cap: ((p90 * 3n) / 2n).toString() };
+}
+
 export type Choice = { model: Model; offer: Offer; score: number; expectedCost: bigint };
 
 /**
