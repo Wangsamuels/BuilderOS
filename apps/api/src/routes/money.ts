@@ -12,19 +12,28 @@ const csvCell = (v: unknown) => {
   return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 };
 
+/** Team-limited approvers (departmentId set) only see cards of that team; daily-cap cards are company-wide. */
+function cardVisible(limit: string | null, card: { payload: unknown }) {
+  if (!limit) return true;
+  return (card.payload as { department_id?: string } | null)?.department_id === limit;
+}
+
 export const moneyRoutes: FastifyPluginAsync = async (app) => {
   // ---------- approvals ----------
   app.get<{ Querystring: { companyId: string; status?: string } }>("/approvals", async (req) => {
     const account = requireAccount(req);
     const { companyId, status = "pending" } = req.query;
     if (!companyId) throw new HttpError(400, "companyId required");
-    // Approval cards are for people the founder made approvers (or admins).
-    await authorize(account, companyId, ["approve"]);
-    const cards = await getDb()
-      .select()
-      .from(approvalCards)
-      .where(and(eq(approvalCards.companyId, companyId), eq(approvalCards.status, status)))
-      .orderBy(desc(approvalCards.createdAt));
+    // Approval cards are for people the founder made approvers (or admins). A team-limited approver sees
+    // only their team's cards; company-wide cards (the daily-cap card) need a company-wide grant.
+    const access = await authorize(account, companyId, ["approve"]);
+    const cards = (
+      await getDb()
+        .select()
+        .from(approvalCards)
+        .where(and(eq(approvalCards.companyId, companyId), eq(approvalCards.status, status)))
+        .orderBy(desc(approvalCards.createdAt))
+    ).filter((c) => cardVisible(access.departmentId, c));
     return { cards };
   });
 
@@ -35,7 +44,8 @@ export const moneyRoutes: FastifyPluginAsync = async (app) => {
     const [card] = await getDb().select().from(approvalCards).where(eq(approvalCards.id, req.params.id));
     if (!card) throw new HttpError(404, "card not found");
     if (card.status !== "pending") throw new HttpError(409, `card is ${card.status}`);
-    await authorize(account, card.companyId, ["approve"]);
+    const access = await authorize(account, card.companyId, ["approve"]);
+    if (!cardVisible(access.departmentId, card)) throw new HttpError(403, "This card belongs to a team your approve grant doesn't cover.", "forbidden");
     // The contract re-checks the approver's grant; approving tells each team to let its agent get the
     // Chain Signatures signature. Big daily cards are split into ≤20 requests per tx.
     const { approvalsPerTx } = await batchLimits(card.companyId);

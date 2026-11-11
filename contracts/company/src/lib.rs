@@ -220,6 +220,18 @@ impl Contract {
             .unwrap_or(false)
     }
 
+    /// The one team a caller's grant is limited to (None = founder, admin, or a company-wide grant).
+    fn team_limit(&self, account: &AccountId) -> Option<AccountId> {
+        if *account == self.founder {
+            return None;
+        }
+        let g = self.grants.get(&account.to_string())?;
+        if g.scopes.iter().any(|s| s == "admin") || g.department_id == env::current_account_id() {
+            return None;
+        }
+        Some(g.department_id.clone())
+    }
+
     /// Founder, or a member the founder granted one of `scopes` to.
     fn assert_founder_or(&self, scopes: &[&str], what: &str) {
         let caller = env::predecessor_account_id();
@@ -290,7 +302,8 @@ impl Contract {
     }
 
     /// 2 = calls to several teams are batched safely (no joint promise returned).
-    /// 3 = allow_seller / set_evm_config / top_up_budget are forwarded without a deposit (they work).
+    /// 3 = allow_seller / set_evm_config / top_up_budget are forwarded without a deposit (they work), and a
+    ///     team-limited approver can only approve/reject their own team's purchases.
     /// Older code has no such method.
     pub fn contract_version(&self) -> u32 {
         3
@@ -467,9 +480,13 @@ impl Contract {
         require!(!self.frozen, "frozen");
         self.roll_day();
         let approver = env::predecessor_account_id();
+        let limit = self.team_limit(&approver);
         let mut out = Vec::with_capacity(request_ids.len());
         for request_id in &request_ids {
             let p = self.pending_approvals.remove(request_id).expect("request is not waiting for approval");
+            if let Some(t) = &limit {
+                require!(&p.department == t, "your approve grant covers another team");
+            }
             self.spent_today += p.amount;
             emit(
                 "purchase_approved",
@@ -493,9 +510,13 @@ impl Contract {
         require!(env::attached_deposit() >= NearToken::from_yoctonear(1), "1 yocto");
         require!(!request_ids.is_empty() && request_ids.len() <= 20, "1..=20 requests per call");
         let approver = env::predecessor_account_id();
+        let limit = self.team_limit(&approver);
         let mut out = Vec::with_capacity(request_ids.len());
         for request_id in &request_ids {
             let p = self.pending_approvals.remove(request_id).expect("request is not waiting for approval");
+            if let Some(t) = &limit {
+                require!(&p.department == t, "your approve grant covers another team");
+            }
             emit("purchase_rejected", json!({ "request_id": request_id, "approvers": [approver], "card_id": card_id, "reason": "rejected_by_approver" }));
             out.push((
                 p.department,
@@ -852,6 +873,17 @@ mod tests {
         let _ = c.approve(vec!["r1".into()], None);
         let _ = c.reject(vec!["r2".into()], None);
         assert!(c.get_pending_approval("r2".into()).is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "your approve grant covers another team")]
+    fn team_limited_approver_cannot_approve_other_team() {
+        let mut c = company();
+        with_build_dept(&mut c);
+        grant(&mut c, "ann.testnet", "code-approver-2", &["view", "approve"], 10_000);
+        c.pending_approvals.insert("r9".into(), PendingApproval { department: acc("ops.acme.builderos-wang.testnet"), amount: 1, reason: "over_limit".into() });
+        ctx("ann.testnet", 1, 2_000);
+        let _ = c.approve(vec!["r9".into()], None);
     }
 
     #[test]

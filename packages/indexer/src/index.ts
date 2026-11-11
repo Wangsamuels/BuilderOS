@@ -61,11 +61,12 @@ export async function runIndexer(opts: IndexerOptions, signal?: AbortSignal) {
   while (!signal?.aborted) {
     try {
       // Never read past what the archive has: a height it doesn't have yet is not an empty block.
-      const rpcHead = (await finalBlock()).header.height as number;
+      // The archive reports its own final head, so steady-state indexing makes no RPC calls at all
+      // (public RPCs answer 429 to shared Heroku IPs). RPC is only the fallback.
       const archiveHead = neardataUrl() ? await archiveFinalHeight().catch(() => null) : null;
-      const head = archiveHead ? Math.min(rpcHead, archiveHead) : rpcHead;
+      const head = archiveHead ?? ((await finalBlock()).header.height as number);
       // Far behind: catch up from the transaction index (only BuilderOS accounts), then jump to the head.
-      const threshold = Number(process.env.INDEXER_BACKFILL_THRESHOLD ?? 20_000);
+      const threshold = Number(process.env.INDEXER_BACKFILL_THRESHOLD ?? 2_000);
       if (txIndexUrl() && head - last > threshold) {
         try {
           const txs = await collectBuilderOsTxs(last, head, log);

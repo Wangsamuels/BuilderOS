@@ -31,6 +31,9 @@ export function originAllowed(origin: string | undefined) {
   return false;
 }
 
+/** Bump with every change to docs/API-CONTRACT.md. */
+export const API_CONTRACT_VERSION = "2026-11-11";
+
 /** Writes whose answer must be fresh every time (a replayed stream token would already be expired). */
 const NO_REPLAY = new Set(["/v1/stream/token", "/v1/auth/logout"]);
 
@@ -124,7 +127,14 @@ export async function buildApp(opts: { log: Logger; hub?: SseHub }): Promise<Fas
     return reply.code(500).send({ error: "internal", message: "Internal error" });
   });
 
-  app.get("/health", async () => ({ ok: true, service: "api", network: env().NETWORK }));
+  app.get("/health", async () => ({
+    ok: true,
+    service: "api",
+    network: env().NETWORK,
+    /** Deployed commit (Heroku: `heroku labs:enable runtime-dyno-metadata`), and the API contract version. */
+    commit: process.env.HEROKU_SLUG_COMMIT ?? process.env.SOURCE_VERSION ?? null,
+    contract: API_CONTRACT_VERSION,
+  }));
 
   await app.register(authRoutes, { prefix: "/v1/auth" });
   await app.register(coreRoutes, { prefix: "/v1" });
