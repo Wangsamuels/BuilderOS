@@ -78,7 +78,12 @@ export async function runIndexer(opts: IndexerOptions, signal?: AbortSignal) {
           log.info({ from: last, to: head, txs: txs.length, reason: throttled >= 2 ? "archive_throttled" : "far_behind" }, "tx-index backfill done");
           if (throttled >= 2) await sleep(5_000); // poll the tx index gently while the archive cools down
           throttled = Math.max(0, throttled - 1);
-          last = head;
+          // Safety margin: the tx index trails the chain by a few seconds, so a very recent transaction may
+          // not be listed yet. Keep the cursor `margin` blocks behind the head; the next round re-reads from
+          // `last - 120`, so every block is read again once it is at least `margin` blocks old. Events still
+          // reach the app as soon as the index lists them (replays are no-ops).
+          const margin = Number(process.env.INDEXER_TXINDEX_MARGIN ?? 60);
+          last = Math.max(last, head - margin);
           await db
             .insert(indexerState)
             .values({ id: "near", lastBlockHeight: last })
