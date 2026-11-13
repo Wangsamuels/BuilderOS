@@ -111,6 +111,7 @@ describe("privy identity token", () => {
     expect(id.email).toBe("a@b.com");
     expect(privyWalletMatches(id, "abcdef", null, null)).toBe(true);
     expect(privyWalletMatches(id, "other", null, null)).toBe(false);
+    expect(id.issuedAt).toBeNull(); // no iat claim in this token
   });
   it("rejects another signer, issuer, audience or an expired token", async () => {
     const other = generateKeyPairSync("ec", { namedCurve: "P-256" });

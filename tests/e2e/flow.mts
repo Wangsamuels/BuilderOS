@@ -284,6 +284,21 @@ let w: Client, p: Client, o: Client, b: Client;
   check("tampered Privy token → 401", await o("POST", "/v1/account/email/privy", { identityToken: forged }), 401);
   check("garbage Privy token → 400", await o("POST", "/v1/account/email/privy", { identityToken: "x".repeat(40) }), 400);
 
+  // NEAR wallet sign-in: Privy is only the email verifier. The token doesn't list the wallet, so it must be fresh.
+  const WX = newKey();
+  const lwx = await login(WX, { method: "wallet" });
+  const wx = client(lwx.json.token);
+  const nowS = Math.floor(Date.now() / 1000);
+  const stale = privyToken({ iat: nowS - 3600, linked_accounts: JSON.stringify([{ type: "email", address: "wallet.user@example.com" }]) });
+  check("wallet session + old Privy token (no wallet link) → 401", await wx("POST", "/v1/account/email/privy", { identityToken: stale }), 401, (j) => j.code !== "bad_privy_token" && j.code);
+  const noIat = privyToken({ iat: undefined, linked_accounts: JSON.stringify([{ type: "email", address: "wallet.user@example.com" }]) });
+  check("wallet session + Privy token without iat → 401", await wx("POST", "/v1/account/email/privy", { identityToken: noIat }), 401);
+  const freshTok = privyToken({ iat: nowS, linked_accounts: JSON.stringify([{ type: "email", address: "Wallet.User@Example.com" }]) });
+  check("wallet session + fresh Privy token → email verified through Privy, no code sent", await wx("POST", "/v1/account/email/privy", { identityToken: freshTok }), 200, (j) => (j.email?.verified !== true || j.email?.source !== "privy") && JSON.stringify(j));
+  check("wallet user no longer needs an email to create a company", await wx("GET", "/v1/auth/me"), 200, (j) => j.needsEmailForCompany !== false && "still needs email");
+  // the strict rule still holds for Privy sign-ins: a fresh token of another person is refused
+  check("Privy session + fresh token of another wallet → 409 privy_wallet_mismatch", await o("POST", "/v1/account/email/privy", { identityToken: freshTok }), 409, (j) => j.code !== "privy_wallet_mismatch" && j.code);
+
   const bound = await client(null)("GET", `/v1/auth/challenge?accountId=${B.implicit}`);
   const payload = nep413Payload({ message: bound.json.message, nonce: Buffer.from(bound.json.nonce, "base64"), recipient: bound.json.recipient });
   const sig = ed25519.sign(createHash("sha256").update(payload).digest(), O.seed);

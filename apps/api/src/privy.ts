@@ -10,7 +10,7 @@ import { env, HttpError } from "@builderos/shared";
  * and that one of the token's linked wallets is the account (or key) that signed in.
  */
 
-export type PrivyIdentity = { userId: string; email: string | null; wallets: string[] };
+export type PrivyIdentity = { userId: string; email: string | null; wallets: string[]; /** when Privy issued the token (unix seconds), or null */ issuedAt: number | null };
 
 let jwksCache: { at: number; keys: Map<string, KeyObject> } | null = null;
 
@@ -77,7 +77,7 @@ export async function verifyPrivyIdentityToken(token: string): Promise<PrivyIden
   const wallets = linked
     .filter((a) => a?.type === "wallet" || a?.type === "smart_wallet")
     .flatMap((a) => [a.address, a.public_key, a.publicKey].filter(Boolean).map((x: unknown) => String(x).toLowerCase()));
-  return { userId: String(claims.sub ?? ""), email, wallets };
+  return { userId: String(claims.sub ?? ""), email, wallets, issuedAt: typeof claims.iat === "number" ? claims.iat : null };
 }
 
 /** True when one of the token's wallets is this account or this ed25519 key (hex, base58, with or without prefix). */

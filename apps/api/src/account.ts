@@ -73,7 +73,7 @@ export async function startEmailVerification(account: string, email: string, log
     attempts: 0,
     expiresAt: new Date(Date.now() + CODE_TTL_MS),
   };
-  const emailConfigured = Boolean((e.NEAR_EMAIL_URL && e.NEAR_EMAIL_PAYMENT_KEY) || e.STABLE_EMAIL_URL);
+  const emailConfigured = Boolean((e.RESEND_API_KEY && e.EMAIL_FROM) || (e.NEAR_EMAIL_URL && e.NEAR_EMAIL_PAYMENT_KEY) || e.STABLE_EMAIL_URL);
   const devEcho = e.NODE_ENV !== "production" && e.EMAIL_DEV_ECHO;
   if (!emailConfigured && !devEcho) throw new HttpError(503, "Email isn't set up on this server yet, so we can't send a code.", "email_unavailable");
 

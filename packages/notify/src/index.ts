@@ -46,8 +46,23 @@ async function debounced(account: string, a: Alert) {
   return r.rows.length > 0;
 }
 
-export async function sendEmail(to: string, subject: string, text: string, log: Logger): Promise<"near-email" | "stable-email"> {
+export async function sendEmail(to: string, subject: string, text: string, log: Logger): Promise<"resend" | "near-email" | "stable-email"> {
   const e = env();
+  // Resend, when configured, is the first choice: a plain HTTPS call with no payment rail behind it.
+  if (e.RESEND_API_KEY && e.EMAIL_FROM) {
+    try {
+      const res = await fetch("https://api.resend.com/emails", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${e.RESEND_API_KEY}` },
+        body: JSON.stringify({ from: e.EMAIL_FROM, to: [to], subject, text }),
+        signal: AbortSignal.timeout(15_000),
+      });
+      if (!res.ok) throw new Error(`resend ${res.status}: ${(await res.text()).slice(0, 200)}`);
+      return "resend";
+    } catch (err: any) {
+      log.warn({ err: err?.message }, "resend failed, trying the other email channels");
+    }
+  }
   const attempt = async () => {
     if (!e.NEAR_EMAIL_URL || !e.NEAR_EMAIL_PAYMENT_KEY) throw new Error("near-email not configured");
     const res = await fetch(e.NEAR_EMAIL_URL, {

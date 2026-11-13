@@ -70,6 +70,10 @@ const EnvSchema = z.object({
   NEAR_EMAIL_URL: z.string().optional(),
   NEAR_EMAIL_PAYMENT_KEY: z.string().optional(),
   STABLE_EMAIL_URL: z.string().optional(),
+  /** Resend (resend.com) API key. When set with EMAIL_FROM, email codes, invites and alerts go out through Resend. */
+  RESEND_API_KEY: z.string().optional(),
+  /** Sender, e.g. "BuilderOS <noreply@yourdomain.com>". Must be on a domain verified in Resend. */
+  EMAIL_FROM: z.string().optional(),
 
   // Local seller mesh
   SELLER_MESH_URL: z.string().default("http://localhost:4100"),

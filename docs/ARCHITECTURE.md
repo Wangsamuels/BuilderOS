@@ -262,7 +262,7 @@ The full matrix (status, auth, shapes, errors) is in [`API-CONTRACT.md`](./API-C
 | Service keys | `WORKER_*` and `VERIFIER_*` (limited keys) |
 | Agents | `AGENT_KEYSTORE_*`, `NEAR_AI_*` |
 | Rails | `BASE_RPC_URL`, `TEMPO_*`, `RELAY_*`, `ONECLICK_*` |
-| Notify | `VAPID_*`, email (`NEAR_EMAIL_*` or `STABLE_EMAIL_URL`; also sends email codes) |
+| Notify | `VAPID_*`, email (`RESEND_API_KEY` + `EMAIL_FROM`, or `NEAR_EMAIL_*`, or `STABLE_EMAIL_URL`; also sends email codes) |
 | Sign-in | `PRIVY_APP_ID` (+ optional `PRIVY_VERIFICATION_KEY` / `PRIVY_JWKS_URL`) |
 | Home | `DEMO_ENABLED` (default on); `EMAIL_DEV_ECHO` (dev/test only, ignored in production) |
 | Testnet sponsor | `TESTNET_SPONSOR_*` |
