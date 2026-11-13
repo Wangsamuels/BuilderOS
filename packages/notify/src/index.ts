@@ -108,12 +108,14 @@ export async function notify(a: Alert, log: Logger) {
       }
     }
 
-    // Email: short alert + link only
+    // Email: short alert + link only, and only to an address the person proved is theirs.
     const [em] = await db.select().from(accountEmails).where(eq(accountEmails.account, account));
-    if (em) {
+    if (em?.verifiedAt) {
       try {
         const { deserialize, openString, serverKey } = await import("@builderos/crypto");
-        const to = await openString(deserialize(em.emailCiphertext), serverKey(env().SESSION_SECRET));
+        const sealed = deserialize(em.emailCiphertext);
+        const key = serverKey(env().SESSION_SECRET);
+        const to = await openString(sealed, key, "email").catch(() => openString(sealed, key));
         const ch = await sendEmail(to, `BuilderOS: ${a.title}`, `${a.body}\n\n${a.url ?? ""}`, log);
         await db.insert(notifications).values({ account, companyId: a.companyId, kind: a.kind, channel: ch, payload, sentAt: new Date() });
       } catch (err: any) {

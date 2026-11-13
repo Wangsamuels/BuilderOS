@@ -13,6 +13,9 @@ declare module "fastify" {
     account?: string;
     sessionHash?: string;
     sessionExpiresAt?: Date;
+    /** Key the session was signed in with (ed25519:…). */
+    sessionPublicKey?: string;
+    loginMethod?: string | null;
   }
 }
 
@@ -49,10 +52,10 @@ export async function issueStreamToken(accountId: string, sessionExpiresAt: Date
   return { token, expiresAt };
 }
 
-export async function issueSession(reply: FastifyReply, accountId: string, publicKey: string) {
+export async function issueSession(reply: FastifyReply, accountId: string, publicKey: string, loginMethod: string | null = null) {
   const token = randomToken(32);
   const expiresAt = new Date(Date.now() + SESSION_MS);
-  await getDb().insert(authSessions).values({ tokenHash: sha256Hex(token), accountId, publicKey, expiresAt });
+  await getDb().insert(authSessions).values({ tokenHash: sha256Hex(token), accountId, publicKey, loginMethod, expiresAt });
   reply.setCookie(COOKIE, token, cookieOptions());
   return { token, expiresAt };
 }
@@ -79,10 +82,12 @@ export async function loadSession(req: FastifyRequest, reply: FastifyReply) {
   req.account = s.accountId;
   req.sessionHash = hash;
   req.sessionExpiresAt = s.expiresAt;
+  req.sessionPublicKey = s.publicKey;
+  req.loginMethod = s.loginMethod;
   const age = Date.now() - (s.rotatedAt ?? s.createdAt).getTime();
   if (age > ROTATE_AFTER_MS && req.cookies?.[COOKIE] === token) {
     await getDb().delete(authSessions).where(eq(authSessions.tokenHash, hash));
-    await issueSession(reply, s.accountId, s.publicKey);
+    await issueSession(reply, s.accountId, s.publicKey, s.loginMethod);
   }
 }
 

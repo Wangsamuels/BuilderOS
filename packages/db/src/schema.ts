@@ -221,6 +221,8 @@ export const authSessions = pgTable(
     tokenHash: text("token_hash").primaryKey(),
     accountId: text("account_id").notNull(),
     publicKey: text("public_key").notNull(),
+    /** "privy" | "wallet" | "unknown" — how the person signed in (informational; identity is the key). */
+    loginMethod: text("login_method"),
     expiresAt: ts("expires_at").notNull(),
     rotatedAt: ts("rotated_at"),
     createdAt: created(),
@@ -252,9 +254,19 @@ export const invites = pgTable("invites", {
   createdAt: created(),
 });
 
+/**
+ * A plan starts as a private draft owned by its author (company_id null) and is bound to a company when
+ * the author launches it. Drafts carry no permissions: only the author can read them until they're bound.
+ */
 export const plans = pgTable("plans", {
   id: uuid("id").primaryKey().defaultRandom(),
-  companyId: text("company_id").notNull(),
+  companyId: text("company_id"),
+  /** Short name shown in the drafts list. */
+  title: text("title"),
+  /** Company the author asked to create for this draft (bound once the chain shows it). */
+  launchCompanyId: text("launch_company_id"),
+  launchedAt: ts("launched_at"),
+  updatedAt: ts("updated_at").defaultNow().notNull(),
   description: text("description").notNull(), // libsodium ciphertext (base64)
   keyVersion: integer("key_version").notNull(),
   features: jsonb("features").$type<PlanFeature[]>().notNull(),
@@ -490,7 +502,71 @@ export const accountEmails = pgTable("account_emails", {
   account: text("account").primaryKey(),
   emailCiphertext: text("email_ciphertext").notNull(),
   emailHash: text("email_hash").notNull(),
+  /** Set once the person proved they own the address (code by email, or a verified Privy identity token). */
+  verifiedAt: ts("verified_at"),
+  source: text("source"), // code | privy
+  updatedAt: ts("updated_at").defaultNow(),
 });
+
+/** One pending email check per account: a 6-digit code (hashed), sent to the address, 10 minutes, 5 tries. */
+export const emailVerifications = pgTable("email_verifications", {
+  account: text("account").primaryKey(),
+  emailCiphertext: text("email_ciphertext").notNull(),
+  emailHash: text("email_hash").notNull(),
+  codeHash: text("code_hash").notNull(),
+  attempts: integer("attempts").default(0).notNull(),
+  expiresAt: ts("expires_at").notNull(),
+  createdAt: created(),
+});
+
+/** Per-account UI state kept on the server (last company opened, dismissed tips). Never used for access. */
+export const accountPrefs = pgTable("account_prefs", {
+  account: text("account").primaryKey(),
+  data: jsonb("data").$type<Record<string, unknown>>().default({}).notNull(),
+  updatedAt: ts("updated_at").defaultNow().notNull(),
+});
+
+/**
+ * What an agent did on one task attempt, built from records (task row, model calls, checks, review, commit,
+ * receipts). `summary` is the agent's own one-paragraph summary; every number comes from `facts`.
+ */
+export const taskReports = pgTable(
+  "task_reports",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    taskId: text("task_id").notNull(),
+    attempt: integer("attempt").default(1).notNull(),
+    planId: uuid("plan_id"),
+    companyId: text("company_id").notNull(),
+    departmentId: text("department_id"),
+    title: text("title").notNull(),
+    tag: text("tag").notNull(),
+    /** done | needs_review | retrying | paused | failed */
+    outcome: text("outcome").notNull(),
+    agent: text("agent"),
+    summary: text("summary"),
+    facts: jsonb("facts").$type<Record<string, unknown>>().default({}).notNull(),
+    cost: amount("cost"),
+    createdAt: created(),
+    updatedAt: ts("updated_at").defaultNow().notNull(),
+  },
+  (t) => [
+    uniqueIndex("task_reports_task_attempt_uq").on(t.taskId, t.attempt),
+    index("task_reports_company_idx").on(t.companyId, t.createdAt),
+    index("task_reports_dept_idx").on(t.departmentId, t.createdAt),
+  ],
+);
+
+/** Inbox items derived from other tables (approval cards, reports, invites) that this account has read. */
+export const inboxReads = pgTable(
+  "inbox_reads",
+  {
+    account: text("account").notNull(),
+    itemId: text("item_id").notNull(),
+    readAt: ts("read_at").defaultNow().notNull(),
+  },
+  (t) => [primaryKey({ columns: [t.account, t.itemId] })],
+);
 
 /** Testnet sponsor drips — persisted so a dyno restart can't be used to drain the sponsor. */
 export const testnetDrips = pgTable("testnet_drips", {

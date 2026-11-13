@@ -166,6 +166,28 @@ record("founder session resolves to implicit account", "POST /v1/auth/verify", 2
 let fo = client(founderSession.token);
 const founderAcct = await signer(founderKey);
 
+// Founders need a verified email before creating a company (API 2026-11-13). Production emails the code:
+// first run sends it (FOUNDER_EMAIL) and stops; run again with EMAIL_CODE=<code>. Verification is per account,
+// so a founder key that's already verified skips this.
+{
+  const acct = await fo("GET", "/v1/account");
+  if (!acct.json?.email?.verified) {
+    if (process.env.EMAIL_CODE) {
+      const v = await fo("POST", "/v1/account/email/verify", { code: process.env.EMAIL_CODE });
+      expect("founder verifies email with the emailed code", "POST /v1/account/email/verify", v, 200);
+    } else {
+      if (!process.env.FOUNDER_EMAIL) throw new Error("this founder has no verified email: set FOUNDER_EMAIL (we send a code), then re-run with EMAIL_CODE");
+      const sent = await fo("POST", "/v1/account/email", { email: process.env.FOUNDER_EMAIL });
+      if (sent.json?.devCode) {
+        expect("founder verifies email (dev echo)", "POST /v1/account/email/verify", await fo("POST", "/v1/account/email/verify", { code: sent.json.devCode }), 200);
+      } else {
+        console.log(`Code sent to ${sent.json?.sentTo ?? process.env.FOUNDER_EMAIL} (${sent.status}). Re-run with EMAIL_CODE=<code> within 10 minutes.`);
+        process.exit(2);
+      }
+    }
+  }
+}
+
 const create = await fo("POST", "/v1/companies", { name: `E2E ${slug}`, slug: companyId /* full id on purpose: must normalise */, preset: "starter", dailyCap: "2000000", teams: [{ team: "eng", monthlyCap: "5000000" }] });
 expect(process.env.SLUG ? "create on existing slug → resume/complete" : "create returns unsigned bundle", "POST /v1/companies", create, 200, (j) => (j.companyId === companyId && (process.env.SLUG ? j.resumed === true : j.transactions.length >= 2) ? null : "bundle shape"), (j) => ({ companyId: j.companyId, resumed: j.resumed, complete: j.complete, txs: j.transactions.map((t: any) => `${t.receiverId}:${t.actions[0].params.methodName}`), requiredYocto: j.requiredYocto }));
 if (create.json.transactions?.length) {

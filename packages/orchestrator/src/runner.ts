@@ -11,6 +11,7 @@ import { seal, serialize, serverKey, sha256Hex } from "@builderos/crypto";
 import { agentFor } from "./keystore.js";
 import { ROLE_FOR_TAG } from "./planner.js";
 import { evaluateAndMaybeHire } from "./hire.js";
+import { recordTaskReport } from "./report.js";
 
 const exec = promisify(execFile);
 const ALWAYS_REVIEW = new Set(["contract", "security"]);
@@ -26,6 +27,33 @@ function parseFiles(text: string): FileOut[] {
   } catch {
     return [];
   }
+}
+
+/** The agent's own one-paragraph summary from its JSON reply, if any. */
+export function parseSummary(text: string): string | null {
+  const m = text.match(/```json\s*([\s\S]*?)```/) ?? text.match(/(\{[\s\S]*\})/);
+  if (!m) return null;
+  try {
+    const j = JSON.parse(m[1]);
+    return typeof j.summary === "string" && j.summary.trim() ? j.summary.trim().slice(0, 1200) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Review reply → verdict + reasons. */
+export function parseReview(text: string | undefined | null): { verdict: "pass" | "fail"; reasons: string[] } {
+  if (!text) return { verdict: "fail", reasons: ["no review"] };
+  const verdict = /"verdict"\s*:\s*"pass"/.test(text) ? "pass" : "fail";
+  let reasons: string[] = [];
+  try {
+    const m = text.match(/\{[\s\S]*\}/);
+    const j = m ? JSON.parse(m[0]) : null;
+    if (Array.isArray(j?.reasons)) reasons = j.reasons.map(String).slice(0, 8).map((r: string) => r.slice(0, 300));
+  } catch {
+    /* keep empty */
+  }
+  return { verdict, reasons };
 }
 
 function safeJoin(root: string, rel: string) {
@@ -84,6 +112,17 @@ export async function runTask(taskId: string, log: Logger) {
   if (resumeRequestId) await db.update(tasks).set({ pauseReason: null }).where(eq(tasks.id, taskId));
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), `task-${taskId}-`));
   const transcript: string[] = [];
+  const startedAt = Date.now();
+  // What the report will say about this attempt (filled in as the run goes).
+  let generator: { model: string; provider: string; rail: string } | null = null;
+  let summary: string | null = null;
+  let fileList: string[] = [];
+  let checks: { passed: boolean; errors: string[] } | null = null;
+  let review: { verdict: "pass" | "fail" | "skipped"; model?: string | null; reasons?: string[] } | null = null;
+  const report = (outcome: Parameters<typeof recordTaskReport>[1]["outcome"], extra: Partial<Parameters<typeof recordTaskReport>[1]> = {}) =>
+    recordTaskReport(taskId, { outcome, summary, files: fileList, checks, review, generator, startedAt, ...extra }).catch((e) =>
+      log.warn({ err: e?.message, taskId }, "task report not written"),
+    );
 
   try {
     // 1-2. Router picks the model; every call is a policy-checked purchase.
@@ -103,9 +142,12 @@ export async function runTask(taskId: string, log: Logger) {
       { fetch: bfetch, log },
     );
     transcript.push(`gen:${gen.model}:${gen.text.slice(0, 4000)}`);
+    generator = { model: gen.model, provider: gen.provider, rail: gen.rail };
+    summary = parseSummary(gen.text);
 
     // 3. Patch in an isolated workspace.
     const files = parseFiles(gen.text);
+    fileList = files.map((f) => f.path);
     if (!files.length) throw new Error("model returned no files");
     for (const f of files) {
       const full = safeJoin(dir, f.path);
@@ -116,13 +158,15 @@ export async function runTask(taskId: string, log: Logger) {
     // 4. Tests (static checks locally; remote runners are paid sellers via MPP).
     const testErrors = await staticChecks(dir, files);
     transcript.push(`tests:${testErrors.length ? testErrors.join("\n") : "pass"}`);
+    checks = { passed: testErrors.length === 0, errors: testErrors.slice(0, 10) };
 
     // 5. Review by a model from a different lab. Contract/security always reviewed.
     let reviewOk = testErrors.length === 0;
+    let reviewInfo: { verdict: "pass" | "fail"; reasons: string[]; model: string | null } | null = null;
     if (reviewOk && (ALWAYS_REVIEW.has(t.tag) || t.tier !== "economy")) {
       const lab = MODELS.find((m) => m.id === gen.model)?.lab;
       const exclude = MODELS.filter((m) => m.lab === lab).map((m) => m.id);
-      const review = await complete(
+      const reviewReply = await complete(
         {
           tag: t.tag,
           tier: t.tier as Tier,
@@ -137,9 +181,12 @@ export async function runTask(taskId: string, log: Logger) {
         },
         { fetch: bfetch, log },
       ).catch(() => null);
-      reviewOk = review ? /"verdict"\s*:\s*"pass"/.test(review.text) : false;
-      transcript.push(`review:${review?.model}:${review?.text.slice(0, 2000)}`);
+      const verdict = parseReview(reviewReply?.text);
+      reviewOk = verdict.verdict === "pass";
+      reviewInfo = { ...verdict, model: reviewReply?.model ?? null };
+      transcript.push(`review:${reviewReply?.model}:${reviewReply?.text.slice(0, 2000)}`);
     }
+    review = reviewInfo ?? (testErrors.length ? null : { verdict: "skipped" });
 
     if (!reviewOk) {
       const [{ attempts }] = await db.select({ attempts: tasks.attempts }).from(tasks).where(eq(tasks.id, taskId));
@@ -147,8 +194,10 @@ export async function runTask(taskId: string, log: Logger) {
         // Two failures ask the founder.
         await db.update(tasks).set({ status: "paused", pauseReason: "review_failed_twice", updatedAt: new Date() }).where(eq(tasks.id, taskId));
         await db.insert(approvalCards).values({ companyId: t.companyId, kind: "single", payload: { type: "task_review", taskId, title: t.title } });
+        await report("paused", { reason: "failed review twice — needs your decision" });
       } else {
         await db.update(tasks).set({ status: "ready", updatedAt: new Date() }).where(eq(tasks.id, taskId));
+        await report("retrying");
       }
       await storeLog(t.departmentId, taskId, transcript);
       return { status: "retry" };
@@ -168,18 +217,22 @@ export async function runTask(taskId: string, log: Logger) {
 
     const logHash = await storeLog(t.departmentId, taskId, transcript);
     await db.update(tasks).set({ status: "review", commitSha: sha, updatedAt: new Date() }).where(eq(tasks.id, taskId));
+    await report("needs_review", { commitSha: sha });
     return { status: "review", sha, logHash };
   } catch (e) {
     if (e instanceof PurchasePending) {
       // Park; resumes on the approval event.
       await db.update(tasks).set({ status: "paused", pauseReason: `purchase:${e.requestId}`, updatedAt: new Date() }).where(eq(tasks.id, taskId));
+      await report("paused", { reason: "a purchase is waiting for approval" });
       return { status: "paused" };
     }
     if (e instanceof PurchaseRejected) {
       await db.update(tasks).set({ status: "failed", pauseReason: e.reason, updatedAt: new Date() }).where(eq(tasks.id, taskId));
+      await report("failed", { reason: `purchase rejected: ${e.reason}` });
       return { status: "failed" };
     }
     await db.update(tasks).set({ status: "ready", updatedAt: new Date() }).where(and(eq(tasks.id, taskId), eq(tasks.status, "running")));
+    await report("retrying", { error: (e as any)?.message ?? String(e) });
     throw e;
   } finally {
     await fs.rm(dir, { recursive: true, force: true }); // wiped after

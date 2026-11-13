@@ -1,7 +1,7 @@
 import type { FastifyPluginAsync } from "fastify";
 import { z } from "zod";
 import { HttpError, InviteBody, PushSubscriptionBody, env } from "@builderos/shared";
-import { accountEmails, and, desc, eq, getDb, invites, notifications, pushSubscriptions } from "@builderos/db";
+import { and, desc, eq, getDb, invites, notifications, pushSubscriptions } from "@builderos/db";
 import { tx, views } from "@builderos/near";
 import { releaseWrapped, uploadWrapped } from "@builderos/keys";
 import { hmacHex, randomToken, seal, serialize, serverKey, sha256Hex } from "@builderos/crypto";
@@ -138,15 +138,6 @@ export const memberRoutes: FastifyPluginAsync = async (app) => {
       .insert(pushSubscriptions)
       .values({ endpoint: body.endpoint, account, p256dh: body.keys.p256dh, auth: body.keys.auth })
       .onConflictDoUpdate({ target: pushSubscriptions.endpoint, set: { account, p256dh: body.keys.p256dh, auth: body.keys.auth } });
-    return { ok: true };
-  });
-
-  app.post("/me/email", async (req) => {
-    const account = requireAccount(req);
-    const { email } = parse(z.object({ email: z.string().email() }), req.body);
-    const sealed = serialize(await seal(email, serverKey(env().SESSION_SECRET), 0));
-    const emailHash = hmacHex(env().SESSION_SECRET, email.toLowerCase());
-    await getDb().insert(accountEmails).values({ account, emailCiphertext: sealed, emailHash }).onConflictDoUpdate({ target: accountEmails.account, set: { emailCiphertext: sealed, emailHash } });
     return { ok: true };
   });
 

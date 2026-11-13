@@ -9,7 +9,7 @@ import type { StreamFilter } from "../sse.js";
 // Upgrade proposals are shown to every member: code can only change after a public 24h wait.
 const EVERYONE = ["company_created", "department_created", "frozen", "unfrozen", "upgrade_proposed", "upgrade_cancelled", "upgrade_applied"];
 const MONEY = ["payment_signed", "receipt", "purchase_requested", "purchase_yielded", "purchase_approved", "purchase_rejected", "topup_requested", "topup_recorded", "withdrawal_requested", "withdrawal_recorded", "float_set", "deposit", "deposit_received", "revenue", "bounty_released", "bounty_voided"];
-const BUILD = ["task_assigned", "agent_registered", "bounty_created", "agent_hired", "bounty_released", "bounty_voided"];
+const BUILD = ["task_assigned", "task_reported", "agent_registered", "bounty_created", "agent_hired", "bounty_released", "bounty_voided"];
 
 /** Founder/admin see every event; members see only the event kinds their scopes cover, for their team. */
 export function streamFilter(a: Access): StreamFilter {

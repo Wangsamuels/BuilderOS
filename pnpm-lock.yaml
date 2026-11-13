@@ -59,6 +59,9 @@ importers:
       '@builderos/near':
         specifier: workspace:*
         version: link:../../packages/near
+      '@builderos/notify':
+        specifier: workspace:*
+        version: link:../../packages/notify
       '@builderos/orchestrator':
         specifier: workspace:*
         version: link:../../packages/orchestrator

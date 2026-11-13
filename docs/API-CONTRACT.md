@@ -1,8 +1,18 @@
 # BuilderOS API contract
 
-**Contract version:** `2026-11-11` (also returned by `GET /health` → `contract`)
+**Contract version:** `2026-11-13` (also returned by `GET /health` → `contract`)
 **Base URL (testnet):** `https://builderos-api-d6d40e9cc381.herokuapp.com`
-**Verified against:** deployed commit `ad62781` on 11 Nov 2026, 74/74 authenticated checks on NEAR testnet (`tests/e2e/live.mts`).
+**Verified against:**
+- `2026-11-11` routes: deployed commit `ad62781`, 74/74 authenticated checks on NEAR testnet (`tests/e2e/live.mts`).
+- `2026-11-13` additions (account home, drafts, analytics, reports, inbox, demo): 169/169 checks in `tests/e2e/flow.mts`. That run uses the real API, indexer and worker event router, with a NEAR testnet simulator in place of testnet.
+
+**What changed in 2026-11-13:**
+- Sign-in no longer leads to a company form. The home works with zero companies; companies are created when the founder launches a draft.
+- New: account and email, drafts, launch from a draft, overview, analytics, reports grouped by team, inbox, preferences, public demo.
+- `POST /v1/companies` needs a verified email for a new company, takes `planId`, and no longer adds a redundant `set_caps` tx to a brand-new company.
+- `GET /v1/auth/challenge` no longer needs `accountId`, so it can be prefetched. `POST /v1/auth/verify` takes `loginMethod` and `privyIdentityToken`.
+- `POST /v1/plans` without `companyId` makes a draft.
+- `POST /v1/me/email` now starts verification instead of saving the address.
 
 This file is the source of truth for the web app. A change to a route's shape changes this file and the contract version.
 
@@ -49,14 +59,20 @@ Every error is `{ "error": code, "code": code, "message": human text, "details"?
 | HTTP | code | When |
 |---|---|---|
 | 400 | `invalid_request` | Validation (`message` lists the fields) |
+| 400 | `wrong_code` | Email code doesn't match (`message` says how many tries are left) |
+| 401 | `bad_privy_token` | Privy identity token invalid, expired, or for another app |
 | 401 | `unauthenticated` | No/expired session, or a stream token used outside `/v1/stream` |
 | 402 | `insufficient_funds` | Create bundle the wallet can't pay (`details: { requiredYocto, availableYocto, funding }`) |
 | 403 | `forbidden` | Not a member, or the grant doesn't cover this (`details.required` = scopes) |
+| 403 | `email_required` | Creating a company before verifying an email (`details.next` = the routes to call) |
 | 404 | `not_found` / `tx_not_found` | Missing resource / tx not visible yet |
+| 409 | `plan_not_launched`, `draft_already_launched`, `privy_no_email`, `privy_wallet_mismatch` | Approving a draft that isn't in a company yet; a draft already in a company; a Privy login with no email, or a Privy token for another wallet |
 | 409 | `slug_taken`, `create_in_progress`, `plan_already_approved`, `version_conflict`, `contract_upgrade_required`, `budget_decrease_unsupported`, `insufficient_funds` (withdrawal), `no_teams`, `tx_mismatch`, `conflict` | State conflicts |
+| 410 | `code_expired`, `invite_expired` | Email code or inbox invite no longer valid |
 | 429 | `rate_limited` | > 60 writes/min per account |
+| 429 | `too_many_attempts` | 5 wrong email codes: ask for a new one |
 | 501 | `not_implemented` | Feature not available: `details: { feature, status: "unsupported" \| "planned", replacement? }` |
-| 503 | `mpc_unavailable`, `sponsor_unavailable`, `unavailable` | Upstream down |
+| 503 | `mpc_unavailable`, `sponsor_unavailable`, `email_unavailable`, `privy_unavailable`, `unavailable` | Upstream down or not configured |
 
 ---
 
@@ -68,19 +84,64 @@ Status: **✅ implemented** · **🟡 partial** (works, limits noted) · **⛔ u
 
 | Method & path | Status | Auth | Request → Response |
 |---|---|---|---|
-| `GET /v1/auth/challenge?accountId=` | ✅ | public | → `{ message, recipient, nonce, expiresAt }` (NEP-413) |
-| `POST /v1/auth/verify` | ✅ | public | `{ accountId, publicKey, signature, message, nonce }` → `{ accountId, token, expiresAt }` (24 h) |
+| `GET /v1/auth/challenge?accountId=` | ✅ | public | `accountId` **optional**. Without it the challenge isn't tied to an account, so the app can fetch it on page load and the sign-in button works on the first click. → `{ message, recipient, nonce, expiresAt, accountBound }` (NEP-413, no RPC) |
+| `POST /v1/auth/verify` | ✅ | public | `{ accountId, publicKey, signature, message, nonce, loginMethod?: "privy"\|"wallet", privyIdentityToken? }` → `{ accountId, token, expiresAt, loginMethod, email, emailError? }`. A challenge works once, even under parallel requests. With a Privy identity token, the email is verified in the same step; a failure only sets `emailError` and never blocks sign-in. |
 | `POST /v1/auth/logout` | ✅ | session | → `{ ok }`; the token stops working at once |
-| `GET /v1/auth/me` · `/session` · `/setup` | ✅ | session | → `{ accountId, companies: [{ companyId, slug, name, isFounder, admin, scopes, departmentId }], companyIds, balance, funding, pendingRefund, setup }`. Each company is re-checked on chain. A company appears as soon as the account creates it (no indexer wait). |
+| `GET /v1/auth/me` · `/session` · `/setup` | ✅ | session | → `{ accountId, loginMethod, email, needsEmailForCompany, companies: [{ companyId, slug, name, isFounder, admin, scopes, departmentId }], companyIds, drafts: [{ id, title, createdAt }], home: { view: "welcome"\|"overview", openCompanyId, demo }, balance, funding, pendingRefund, setup: { steps, next, completed, total, showBanner } }`. Every company is re-checked on chain. Setup steps in order: `account`, `email`, `describe`, `fund`, `launch`, `approve`. Setup is progress, **never a gate**. |
 | Session refresh | 🟡 | — | No refresh endpoint. Sessions last 24 h; a cookie session older than 12 h is rotated automatically. On a 401, sign in again. |
 | `POST /v1/auth/fund-testnet` | ✅ | session | testnet only; sends the create shortfall once per account |
+
+### Account and email (no company needed)
+
+Founders need a **verified email before creating a company**. Privy sign-ins get it from Privy at sign-in. NEAR wallet sign-ups add it with a 6-digit code.
+
+| Method & path | Status | Auth | Request → Response |
+|---|---|---|---|
+| `GET /v1/account` | ✅ **new** | session | → `{ accountId, loginMethod, email: { address (masked), verified, source: "code"\|"privy"\|null, pending (masked) }, needsEmailForCompany, preferences }` |
+| `POST /v1/account/email` | ✅ **new** | session | `{ email }` → `{ ok, sentTo (masked), expiresAt }`. The code expires in 10 min; limit 5 per hour. Outside production with `EMAIL_DEV_ECHO=1`, the response also has `devCode`. A verified address stays in use until the new one is confirmed. `POST /v1/me/email` is the same route under its old name. |
+| `POST /v1/account/email/verify` | ✅ **new** | session | `{ code }` → `{ ok, email }`. Errors: 400 `wrong_code`, 410 `code_expired`, 429 `too_many_attempts` (after 5 wrong codes), 404 (no code pending). |
+| `POST /v1/account/email/privy` | ✅ **new** | session | `{ identityToken }` → `{ ok, email }`. The token must be a valid Privy ES256 token for `PRIVY_APP_ID`, and one of its linked wallets must be the signed-in account or key (else 409 `privy_wallet_mismatch`). |
+| `GET /v1/account/preferences` · `PATCH` | ✅ **new** | session | `{ lastCompanyId?: string\|null, dismissed?: string[] }` → `{ preferences }`. `lastCompanyId` must be a company you can open (checked on chain; 403 otherwise). It only decides what the home opens, never access. |
+
+### Home: overview, inbox, demo
+
+| Method & path | Status | Auth | Request → Response |
+|---|---|---|---|
+| `GET /v1/overview?fresh=1` | ✅ **new** | session | → `{ home, email, totals: { companies, founded, spentToday, budget, spent, pendingApprovals, tasksRunning, tasksDone, needsAttention }, companies: [{ companyId, slug, name, role: founder\|admin\|member, scopes, departmentId, frozen, teams, money\|null, work\|null, approvals\|null }], drafts, inbox: { unread } }`. Sections follow the grant: `money` for view/approve, `work` for builder/code, `approvals` for approve; founder and admin get all three. A team-limited grant sees only its team. Chain numbers are cached about 8 s across companies; `?fresh=1` re-reads them (use it right after signing). Works with zero companies (`home.view = "welcome"`). |
+| `GET /v1/inbox?limit=` | ✅ **new** | session | → `{ items: [{ id, kind: approval\|report\|invite\|alert, companyId, slug, title, body, at, read, urgent, action }], unread }`, across all your companies and filtered by grant. A team approver sees only their team's cards. Invites sent to your **verified** email appear here. |
+| `POST /v1/inbox/read` | ✅ **new** | session | `{ ids?: string[], all?: boolean }` → `{ ok, marked }` |
+| `POST /v1/inbox/invites/:id/accept` | ✅ **new** | session | Only for an invite sent to your verified email (404 otherwise) → `{ companyId, transaction }` (`accept_invite`; no code needed). 410 `invite_expired`. |
+| `GET /v1/demo?range=7d\|14d\|30d\|90d` | ✅ **new** | **public** | The read-only sample company "Lumen Notes", in one payload: `{ demo: true, readOnly: true, notice, company, access, overview, teams, analytics, reports, approvals, plan, tasks, members }`. Shapes match the real endpoints, so the same screens render it. The data is invented and fixed for everyone (dates follow the clock), and nothing is read from chain or the database. There are no write routes. `DEMO_ENABLED=0` turns it off. |
+| `GET /v1/demo/analytics?range=` · `GET /v1/demo/reports/:id` | ✅ **new** | public | Pieces of the same demo. |
+
+### Drafts (describe before any company exists)
+
+A draft is a product idea with a plan, an estimate and a suggested company setup. It belongs to its author and to no company, nothing is on chain, and nothing costs money. Only the author can read it; to anyone else every draft route answers 404. Launching moves it into a company, and its text is re-sealed to that company.
+
+| Method & path | Status | Auth | Request → Response |
+|---|---|---|---|
+| `POST /v1/drafts` | ✅ **new** | session | `{ what, who?, howTheyPay?, private?, tier?, title? }` or `{ description, ... }` → `{ draft }`. `draft` = `{ id, title, status: draft\|launching\|launched, companyId: null, launchCompanyId, tier, features: [{ key, title, tag, size, dependsOn, team, estimate }], estimate: { p50, p90, cap }, suggestedSetup: { name, slug, dailyCap, teams: [{ team, monthlyCap, perTxLimit, features, estimatedCap }], funding }, description }`. Limit 20 per hour. |
+| `GET /v1/drafts` | ✅ **new** | session | → `{ drafts }`: your drafts not yet in a company, newest first |
+| `GET /v1/drafts/:id` · `PATCH` · `DELETE` | ✅ **new** | author | PATCH `{ title?, description? (re-plans), features?, removeKeys?, tier? }` → re-estimated `{ draft }`. A launched draft → 409 `draft_already_launched` with `details.companyId`. |
+| `POST /v1/drafts/:id/launch` | ✅ **new** | author + admin of the company | `{ companyId }` → `{ plan, next }`: put a draft into a company you founded or administer |
+| `POST /v1/plans` without `companyId` | ✅ | session | Same as `POST /v1/drafts` (older clients) |
+| `GET /v1/plans?companyId=` | ✅ **new** | builder | → `{ plans: [{ id, title, tier, estimate, features, approvedAt, tasks: {status:n} }] }` |
+| `GET /v1/plans/:id` | ✅ | author (draft) / builder | A draft returns `plan` as a draft view (with description), `tasks: []` |
+
+**Launch flow:**
+1. Call `POST /v1/companies { name, slug, planId }`. The teams, budgets and daily cap default to the draft's `suggestedSetup`; any you send win.
+2. Sign the returned transactions.
+3. Poll `GET /v1/companies/creation/:slug` until `companyExists`. Its `plansBound` lists the draft, which is now in the company.
+4. Call `POST /v1/plans/:id/approve`. It also binds the draft if the poll hasn't yet.
+
+If the chain create fails (for example someone took the slug first), the draft stays yours as `launching` and can be launched again under another slug.
 
 ### Companies, teams, settings
 
 | Method & path | Status | Auth | Request → Response |
 |---|---|---|---|
-| `POST /v1/companies` | ✅ | session | `{ name, slug, preset?, dailyCap?, teams?: [{ team, monthlyCap }], departments?: [...], autoApproveLimit? }` → `{ companyId, transactions, resumed, complete, missing, verify, funding, requiredYocto }`. Same slug = resume. Errors: 402, 409 `slug_taken` / `create_in_progress`. |
-| `GET /v1/companies/creation/:slug` | ✅ | session | → `{ slugTaken, founderIsYou, companyExists, departments, dailyCap, pendingRefundYocto }` |
+| `POST /v1/companies` | ✅ | session + verified email | `{ name, slug, planId?, preset?, dailyCap?, teams?: [{ team, monthlyCap }], departments?: [...], autoApproveLimit? }` → `{ companyId, transactions, resumed, complete, missing, verify, funding, requiredYocto, teams, dailyCap, planId? }`. Same slug = resume (no email check). A new company is `create_company` + one `create_department` per team; `create_company` sets the daily cap, so there's no extra `set_caps`. Errors: 402, 403 `email_required`, 404 (`planId` not yours), 409 `slug_taken` / `create_in_progress` / `draft_already_launched`. |
+| `GET /v1/companies/creation/:slug` | ✅ | session | → `{ slugTaken, founderIsYou, companyExists, departments, dailyCap, pendingRefundYocto, plansBound }` (`plansBound` = drafts that just joined this company) |
 | `GET /v1/companies` | ✅ | session | → `{ companies: [...membership + cached row] }` |
 | `GET /v1/companies/:id` | ✅ | any scope | → `{ company, companyId, slug, departments (own team for limited grants), chain, access: { founder, admin, scopes, departmentId, expiresAtMs } }` |
 | `POST /v1/companies/claim-refund` | ✅ | session | → `{ amountYocto, amountNear, transaction }`, or 404 when nothing is owed |
@@ -108,6 +169,20 @@ Status: **✅ implemented** · **🟡 partial** (works, limits noted) · **⛔ u
 | `GET /v1/services` · `POST /v1/services/:id/cancel` | 🗓 | — | 501 planned |
 | `POST /v1/freeze` | ✅ | admin | `{ companyId, departments? }` → `{ transactions }` (pause all = one `freeze`) |
 | `POST /v1/unfreeze` | ✅ | founder | `{ companyId }` → `{ transactions }` |
+
+### Analytics and agent reports
+
+| Method & path | Status | Auth | Request → Response |
+|---|---|---|---|
+| `GET /v1/analytics?companyId=&range=7d\|14d\|30d\|90d&team=` | ✅ **new** | any scope | → `{ range, teams, sections: { money, work, control }, money, work, control }`. Each section is `null` when the grant doesn't cover it. A team-limited grant gets its own team only; asking for another → 403. Read fresh from chain.<br>• **money** (view/approve): `total`, `byDay[{ day, total, byTeam }]`, `byTeam[{ spentInRange, budget, spent, reserved, available, burnPerDay, runwayDays }]`, `byModel`, `bySeller`, `dailyCap{ cap, spentToday, usedPct }`. Spend = signed payments.<br>• **work** (builder/code): `tasks`, `tasksByTeam`, `completedByDay`, `reviewPassRate`, `reviewed`, plus with money scope `costPerDoneTask` and `estimateVsActual`.<br>• **control** (approve): `approvals{ pending, oldestPendingAt, decidedInRange }`, `blockedPurchases` (payee mismatch), `pausedTeams`, `companyFrozen`. |
+| `GET /v1/reports?companyId=&team=&days=7&limit=20&outcome=` | ✅ **new** | any scope | **Grouped by team** (every team on chain, even with no reports): `{ groupBy: "team", teams: [{ team, departmentId, summary: { done, needsReview, retrying, paused, failed, reports, cost, headline }, reports: [report] }] }`. |
+| `GET /v1/reports/:id` | ✅ **new** | any scope (own team) | → `{ report, attempts: [{ id, attempt, outcome, at }] }` |
+
+**A report** = `{ id, taskId, attempt, team, title, tag, outcome: done|needs_review|retrying|paused|failed, agent, summary, summarySource: "agent", cost, facts }`.
+- `summary` is the agent's own summary of its work.
+- Every number comes from records, never from the agent: model calls, checks, the cross-lab review, the commit and receipts.
+- `facts` holds `files`, `checks`, `review`, `commitSha` and `generator` for builder/code scopes, and `models`, `receipts`, `estimate` and `taskCostSoFar` for view/approve. `cost` is `null` without a money scope.
+- The task runner writes one report per attempt. A new report reaches the live stream as `task_reported` (builder scope).
 
 ### Plans, tasks, agents
 
@@ -172,7 +247,7 @@ Status: **✅ implemented** · **🟡 partial** (works, limits noted) · **⛔ u
 
 - Everyone: `company_created`, `department_created`, `frozen`, `unfrozen`, `upgrade_proposed`, `upgrade_cancelled`, `upgrade_applied`
 - view/approve: money events — `payment_signed`, `receipt`, `purchase_requested`, `purchase_yielded`, `purchase_approved`, `purchase_rejected`, `topup_*`, `withdrawal_*`, `float_set`, `deposit`, **`deposit_received`**, `revenue`, `bounty_*`
-- builder: `task_assigned`, `agent_registered`, `bounty_created`, `agent_hired`
+- builder: `task_assigned`, **`task_reported`** (off-chain, from the task runner: `{ report_id, task_id, title, outcome, attempt, cost }`), `agent_registered`, `bounty_created`, `agent_hired`
 - Founder/admin: everything
 
 `deposit_received.data` = `{ company_id, department_id, address, chain_id, token, amount, balance }`. Amount and balance are micro-USDC. It's written by the worker when a team's Base USDC balance goes up (checked every 60 s).
@@ -180,6 +255,9 @@ Status: **✅ implemented** · **🟡 partial** (works, limits noted) · **⛔ u
 ---
 
 ## 3. Known limits (honest status)
+
+- **Invitees need a little NEAR for gas.** On testnet a brand-new wallet has 0 NEAR and can't sign `accept_invite` until it holds some, e.g. 0.1 NEAR; `POST /v1/auth/fund-testnet` covers founders only.
+- **Reports from real model runs** are written by the task runner, which pays models through Base USDC. They appear once a team is funded and has agents.
 
 - **Company-level deposit and withdrawals** need NEAR Intents, which isn't on testnet. On testnet, teams are funded directly at their Base Sepolia USDC addresses.
 - **Changing per-purchase / auto-approve limits** after create isn't possible in the contracts. Changing it would need a contract change plus the 24 h upgrade.

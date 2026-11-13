@@ -21,9 +21,18 @@ export const TaskTag = z.enum([
   "expert",
 ]);
 
-export const ChallengeQuery = z.object({ accountId: AccountId });
+/**
+ * `accountId` is optional so the web app can fetch a challenge before it knows the account (prefetch on page
+ * load, so the sign-in button works on the first click). Identity always comes from the signing key.
+ */
+export const ChallengeQuery = z.object({ accountId: AccountId.optional() });
+export const LoginMethod = z.enum(["privy", "wallet"]);
 export const VerifyBody = z.object({
   accountId: AccountId,
+  /** How the person signed in: Privy (Google/email embedded wallet) or a NEAR wallet. */
+  loginMethod: LoginMethod.optional(),
+  /** Privy identity token (Privy sign-in only): verifies the person's email in the same step. */
+  privyIdentityToken: z.string().min(20).max(20_000).optional(),
   /** ed25519:… — prefix added if the client omits it (some Privy adapters). */
   publicKey: z
     .string()
@@ -66,11 +75,13 @@ export const CreateCompanyBody = z
     /** "sezk" or the full company account "sezk.<factory>" (normalised to "sezk"). */
     slug: z.preprocess((v) => (typeof v === "string" ? v.trim().toLowerCase().split(".")[0] : v), z.string().regex(/^[a-z0-9-]{2,32}$/)),
     preset: z.string().default("saas-starter"),
-    dailyCap: UsdcAmount.default("50000000"),
+    dailyCap: UsdcAmount.optional(),
     departments: z.array(z.object({ name: DepartmentName, budget: UsdcAmount, perTxLimit: UsdcAmount })).min(1).max(6).optional(),
     /** Web app shape: teams[{ team, monthlyCap }] (mapped to departments; per-tx limit = autoApproveLimit or 5% of the cap). */
     teams: z.array(z.object({ team: DepartmentName, monthlyCap: UsdcAmount })).min(1).max(6).optional(),
     autoApproveLimit: UsdcAmount.optional(),
+    /** Launch this draft: teams and budgets default to the draft's suggested setup; the draft joins the company. */
+    planId: z.uuid().optional(),
   })
   .transform((b) => {
     const departments =
@@ -82,7 +93,7 @@ export const CreateCompanyBody = z
             return { name: t.team, budget: t.monthlyCap, perTxLimit: perTx };
           })
         : DEFAULT_DEPARTMENTS);
-    return { name: b.name, slug: b.slug, preset: b.preset, dailyCap: b.dailyCap, departments };
+    return { name: b.name, slug: b.slug, preset: b.preset, dailyCap: b.dailyCap ?? "50000000", dailyCapGiven: b.dailyCap !== undefined, departments, planId: b.planId, teamsGiven: Boolean(b.departments ?? b.teams) };
   })
   .superRefine((b, ctx) => {
     const names = b.departments.map((d) => d.name);
@@ -104,6 +115,46 @@ export const CreatePlanBody = z.object({
   description: z.string().min(10).max(20_000),
   tier: Tier.default("standard"),
 });
+
+/**
+ * A draft: the Describe answers (or a free-text description). No company, no chain, no money.
+ * `description` wins when given; otherwise it is built from what / who / howTheyPay.
+ */
+export const CreateDraftBody = z
+  .object({
+    title: z.string().trim().min(2).max(80).optional(),
+    description: z.string().trim().min(10).max(20_000).optional(),
+    what: z.string().trim().min(3).max(4_000).optional(),
+    who: z.string().trim().max(2_000).optional(),
+    howTheyPay: z.string().trim().max(2_000).optional(),
+    /** "Keep my code private" → private tier (TEE models only). */
+    private: z.boolean().optional(),
+    tier: Tier.optional(),
+  })
+  .strict()
+  .superRefine((b, ctx) => {
+    if (!b.description && !b.what) ctx.addIssue({ code: "custom", message: "describe the product: send description, or what (+ who, howTheyPay)", path: ["what"] });
+  })
+  .transform((b) => {
+    const description =
+      b.description ??
+      [`Build: ${b.what}`, b.who ? `For: ${b.who}` : null, b.howTheyPay ? `How they pay: ${b.howTheyPay}` : null].filter(Boolean).join("\n");
+    const tier = b.tier ?? (b.private ? "private" : "standard");
+    const title = b.title ?? (b.what ?? b.description ?? "").split(/[.\n]/)[0].trim().slice(0, 80);
+    return { title: title.length >= 2 ? title : "Untitled product", description, tier };
+  });
+
+export const EmailBody = z.object({ email: z.string().trim().toLowerCase().pipe(z.email().max(254)) });
+export const EmailCodeBody = z.object({ code: z.string().trim().regex(/^\d{6}$/, "6-digit code") });
+export const PrivyEmailBody = z.object({ identityToken: z.string().min(20).max(20_000) });
+export const PreferencesBody = z
+  .object({
+    /** Company the home screen opens next time (re-checked on chain when read). null clears it. */
+    lastCompanyId: z.string().nullable().optional(),
+    /** Tips / banners the person closed. */
+    dismissed: z.array(z.string().max(64)).max(100).optional(),
+  })
+  .strict();
 
 export const EstimateQuery = z.object({
   tag: TaskTag,

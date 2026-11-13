@@ -1,7 +1,7 @@
 import type { FastifyPluginAsync, FastifyRequest } from "fastify";
 import { randomBytes } from "node:crypto";
 import { ChallengeQuery, VerifyBody, env, network, HttpError } from "@builderos/shared";
-import { authChallenges, authSessions, eq, getDb, inArray, plans, testnetDrips } from "@builderos/db";
+import { authChallenges, authSessions, desc, eq, getDb, inArray, isNotNull, plans, testnetDrips } from "@builderos/db";
 import {
   companyCreateFunding,
   resolveLoginAccountId,
@@ -14,6 +14,12 @@ import {
 } from "@builderos/near";
 import { COOKIE, cookieOptions, issueSession, requireAccount, visibleCompanies, companiesFor } from "../auth.js";
 import { originAllowed, parse } from "../app.js";
+import { and, isNull } from "@builderos/db";
+import { emailStatus, getPrefs } from "../account.js";
+import { attachPrivyEmail } from "./account.js";
+
+/** Stored as the challenge's account when the client didn't name one (prefetched challenge). */
+const ANY_ACCOUNT = "*";
 
 /** Accounts that must never be used as the testnet sponsor (their NEAR backs storage + refunds). */
 function sponsorIsProtected(id: string) {
@@ -51,14 +57,18 @@ function normalizePublicKey(pk: string): string {
 export const authRoutes: FastifyPluginAsync = async (app) => {
   const ipLimit = { rateLimit: { max: 20, timeWindow: "1 minute", keyGenerator: (req: { ip: string }) => req.ip } };
 
+  /**
+   * NEP-413 challenge. No RPC, so it answers in a few ms. `accountId` is optional: the web app can prefetch a
+   * challenge on page load and sign it with whichever wallet the person picks (identity comes from the key).
+   */
   app.get("/challenge", { config: ipLimit }, async (req) => {
     const { accountId } = parse(ChallengeQuery, req.query);
     const nonce = randomBytes(32);
     const expiresAt = new Date(Date.now() + CHALLENGE_TTL_MS);
     const recipient = challengeRecipient(req);
-    const message = `Sign in to BuilderOS\nAccount: ${accountId}\nRecipient: ${recipient}\nExpires: ${expiresAt.toISOString()}`;
-    await getDb().insert(authChallenges).values({ nonce: nonce.toString("base64"), accountId, message, expiresAt });
-    return { message, recipient, nonce: nonce.toString("base64"), expiresAt };
+    const message = `Sign in to BuilderOS\nAccount: ${accountId ?? "(the signing wallet)"}\nRecipient: ${recipient}\nExpires: ${expiresAt.toISOString()}`;
+    await getDb().insert(authChallenges).values({ nonce: nonce.toString("base64"), accountId: accountId ?? ANY_ACCOUNT, message, expiresAt });
+    return { message, recipient, nonce: nonce.toString("base64"), expiresAt, accountBound: Boolean(accountId) };
   });
 
   app.post("/verify", { config: ipLimit }, async (req, reply) => {
@@ -66,7 +76,7 @@ export const authRoutes: FastifyPluginAsync = async (app) => {
     const body = raw;
     const db = getDb();
     const [ch] = await db.select().from(authChallenges).where(eq(authChallenges.nonce, body.nonce));
-    if (!ch || ch.usedAt || ch.expiresAt < new Date() || ch.accountId !== body.accountId || ch.message !== body.message)
+    if (!ch || ch.usedAt || ch.expiresAt < new Date() || (ch.accountId !== ANY_ACCOUNT && ch.accountId !== body.accountId) || ch.message !== body.message)
       throw new HttpError(401, "challenge invalid or expired", "bad_challenge");
 
     const fromMessage = /^Recipient: (.+)$/m.exec(body.message)?.[1]?.trim();
@@ -95,10 +105,30 @@ export const authRoutes: FastifyPluginAsync = async (app) => {
       throw new HttpError(401, "bad signature — sign with challenge.recipient and the exact challenge.message", "bad_signature");
     }
 
+    // Single use: claim the challenge atomically so two parallel verifies can't both get a session.
+    const claimed = await db
+      .update(authChallenges)
+      .set({ usedAt: new Date() })
+      .where(and(eq(authChallenges.nonce, body.nonce), isNull(authChallenges.usedAt)))
+      .returning({ nonce: authChallenges.nonce });
+    if (!claimed.length) throw new HttpError(401, "challenge invalid or expired", "bad_challenge");
     const accountId = await resolveLoginAccountId(body.accountId, body.publicKey, req.log);
-    await db.update(authChallenges).set({ usedAt: new Date() }).where(eq(authChallenges.nonce, body.nonce));
-    const { token, expiresAt } = await issueSession(reply, accountId, body.publicKey);
-    return { accountId, token, expiresAt };
+    const loginMethod = body.loginMethod ?? (body.privyIdentityToken ? "privy" : null);
+    const { token, expiresAt } = await issueSession(reply, accountId, body.publicKey, loginMethod);
+
+    // Privy: verify the person's email in the same step (never blocks sign-in).
+    let email: Awaited<ReturnType<typeof emailStatus>> | null = null;
+    let emailError: string | null = null;
+    if (body.privyIdentityToken) {
+      try {
+        await attachPrivyEmail(accountId, body.publicKey, body.privyIdentityToken);
+      } catch (e: any) {
+        emailError = e?.code ?? "privy_email_failed";
+        req.log.warn({ err: e?.message }, "privy email not attached at sign-in");
+      }
+    }
+    email = await emailStatus(accountId).catch(() => null);
+    return { accountId, token, expiresAt, loginMethod, email, ...(emailError ? { emailError } : {}) };
   });
 
   app.post("/logout", async (req, reply) => {
@@ -109,12 +139,13 @@ export const authRoutes: FastifyPluginAsync = async (app) => {
   });
 
   /**
-   * Session + setup progress for dashboard banner / Describe funding CTA.
-   * Sign-in alone creates the account — Describe is not part of auth.
+   * Who is signed in, which companies they can open (each re-checked on chain), their drafts, email status and
+   * setup progress. Signing in never requires a company: the home screen works with zero companies.
    */
-  async function buildSetup(account: string) {
+  async function buildSetup(account: string, req: FastifyRequest) {
     const memberships = await companiesFor(account); // each one re-checked on chain
     const companies = memberships.map((m) => m.companyId);
+    const founded = memberships.filter((m) => m.isFounder).map((m) => m.companyId);
     const funding = companyCreateFunding(3);
     const bal = await viewAccount(account).catch(() => ({
       exists: false,
@@ -124,37 +155,65 @@ export const authRoutes: FastifyPluginAsync = async (app) => {
     }));
     const available = BigInt(bal.availableYocto);
     const need = BigInt(funding.recommendedYocto);
-    const hasCompany = companies.length > 0;
+    const hasCompany = founded.length > 0;
     const fundedEnough = hasCompany || available >= need;
 
-    let hasPlan = false;
-    if (companies.length) {
-      const rows = await getDb().select({ id: plans.id }).from(plans).where(inArray(plans.companyId, companies)).limit(1);
-      hasPlan = rows.length > 0;
+    const db = getDb();
+    const draftRows = await db
+      .select({ id: plans.id, title: plans.title, createdAt: plans.createdAt, companyId: plans.companyId })
+      .from(plans)
+      .where(eq(plans.createdBy, account))
+      .orderBy(desc(plans.updatedAt))
+      .limit(50);
+    const drafts = draftRows.filter((p) => !p.companyId);
+    let approved = false;
+    if (founded.length) {
+      const rows = await db.select({ id: plans.id }).from(plans).where(and(inArray(plans.companyId, founded), isNotNull(plans.approvedAt))).limit(1);
+      approved = rows.length > 0;
     }
+    const hasPlan = draftRows.length > 0 || approved;
 
-    const pendingRefund = BigInt(await views.getPendingRefund(account).catch(() => "0"));
+    const [pendingRefund, email, prefs] = await Promise.all([
+      views.getPendingRefund(account).then((v) => BigInt(v ?? "0")).catch(() => 0n),
+      emailStatus(account),
+      getPrefs(account),
+    ]);
 
     const steps = [
-      { id: "account", done: true as const, label: "Account created" },
+      { id: "account", done: true as const, label: "Signed in" },
+      { id: "email", done: email.verified, label: "Verify your email", requiredFor: "launch" },
+      { id: "describe", done: hasPlan, label: "Describe your product" },
       {
         id: "fund",
         done: fundedEnough,
         label: hasCompany ? "Wallet funded" : `Add ~${funding.recommendedNear} testnet NEAR`,
         requiredNear: funding.recommendedNear,
       },
-      { id: "company", done: hasCompany, label: "Create your company" },
-      { id: "describe", done: hasPlan, label: "Describe your product" },
+      { id: "launch", done: hasCompany, label: "Launch your company" },
+      { id: "approve", done: approved, label: "Approve the plan so agents start" },
     ];
     const completed = steps.filter((s) => s.done).length;
     const next = steps.find((s) => !s.done)?.id ?? null;
+    // Last company the person opened, if they can still open it; else the first one.
+    const last = typeof prefs.lastCompanyId === "string" && companies.includes(prefs.lastCompanyId) ? prefs.lastCompanyId : null;
 
     return {
       accountId: account,
+      loginMethod: req.loginMethod ?? null,
+      email,
+      /** Founders need a verified email before launching a company. */
+      needsEmailForCompany: !email.verified,
       /** Companies this account can open: { companyId, slug, name, isFounder, admin, scopes, departmentId }. */
       companies: memberships,
       /** Same list as plain ids (older clients). */
       companyIds: companies,
+      drafts: drafts.map((d) => ({ id: d.id, title: d.title, createdAt: d.createdAt })),
+      home: {
+        /** welcome = no companies yet (show Describe + drafts + demo); overview = portfolio across companies. */
+        view: companies.length ? "overview" : "welcome",
+        openCompanyId: last ?? companies[0] ?? null,
+        demo: env().DEMO_ENABLED ? "/v1/demo" : null,
+      },
       balance: {
         exists: bal.exists,
         availableYocto: bal.availableYocto,
@@ -170,18 +229,17 @@ export const authRoutes: FastifyPluginAsync = async (app) => {
         completed,
         total: steps.length,
         next,
-        /** Soft banner on dashboard when setup incomplete — FE owns copy. */
+        /** Progress card on the home screen while setup is incomplete — never a gate. */
         showBanner: next !== null,
       },
     };
   }
 
-  const me = async (req: FastifyRequest) => buildSetup(requireAccount(req));
+  const me = async (req: FastifyRequest) => buildSetup(requireAccount(req), req);
   app.get("/me", me);
-  /** Alias for FE contract draft that expected /v1/auth/session */
+  /** Aliases (same payload). */
   app.get("/session", me);
-  /** Explicit setup payload (same as /me) for dashboard progress + Describe deposit CTA. */
-  app.get("/setup", async (req) => buildSetup(requireAccount(req)));
+  app.get("/setup", me);
 
   /**
    * Testnet-only: drip recommendedNear from TESTNET_SPONSOR_* to the signed-in account.

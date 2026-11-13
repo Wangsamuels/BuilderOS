@@ -14,6 +14,9 @@ import { moneyRoutes } from "./routes/money.js";
 import { memberRoutes } from "./routes/members.js";
 import { streamRoutes } from "./routes/stream.js";
 import { extraRoutes } from "./routes/extra.js";
+import { accountRoutes } from "./routes/account.js";
+import { draftRoutes } from "./routes/drafts.js";
+import { homeRoutes } from "./routes/home.js";
 
 export function parse<T extends z.ZodTypeAny>(schema: T, data: unknown): z.infer<T> {
   const r = schema.safeParse(data);
@@ -32,7 +35,7 @@ export function originAllowed(origin: string | undefined) {
 }
 
 /** Bump with every change to docs/API-CONTRACT.md. */
-export const API_CONTRACT_VERSION = "2026-11-11";
+export const API_CONTRACT_VERSION = "2026-11-13";
 
 /** Writes whose answer must be fresh every time (a replayed stream token would already be expired). */
 const NO_REPLAY = new Set(["/v1/stream/token", "/v1/auth/logout"]);
@@ -142,6 +145,9 @@ export async function buildApp(opts: { log: Logger; hub?: SseHub }): Promise<Fas
   await app.register(memberRoutes, { prefix: "/v1" });
   await app.register(streamRoutes, { prefix: "/v1" });
   await app.register(extraRoutes, { prefix: "/v1" });
+  await app.register(accountRoutes, { prefix: "/v1" });
+  await app.register(draftRoutes, { prefix: "/v1" });
+  await app.register(homeRoutes, { prefix: "/v1" });
   return app;
 }
 

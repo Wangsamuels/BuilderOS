@@ -161,10 +161,15 @@ REST + JSON under `/v1`, validated with zod. Rate limits are 60 writes per minut
 
 | Endpoint | Does |
 |---|---|
-| `GET /auth/challenge` · `POST /auth/verify` · `GET /auth/me` | NEAR sign-in |
-| `POST /companies` · `GET /companies[/:id]` | Create a company from a preset → `create_company`, departments, caps. Checks the slug and wallet balance first; a partial create resumes with only the missing steps |
+| `GET /auth/challenge` · `POST /auth/verify` · `GET /auth/me` | Sign in with Privy (Google/email) or a NEAR wallet (NEP-413). The home works with no company |
+| `GET /account` · `POST /account/email[/verify\|/privy]` · `PATCH /account/preferences` | Email (verified by code or Privy; needed before creating a company), last company opened |
+| `POST /drafts` · `GET/PATCH/DELETE /drafts/:id` · `POST /drafts/:id/launch` | Describe a product → private draft with plan, estimate and suggested company setup; no chain, no money |
+| `GET /overview` · `GET /inbox` | Home: every company you can open with the numbers your grant covers; approvals, agent reports and invites in one inbox |
+| `GET /analytics` · `GET /reports[/:id]` | Company dashboard: spend by day/team/model/seller, budgets and runway, work and review rate; agent work reports grouped by team |
+| `GET /demo` | Public, read-only sample company (invented data) |
+| `POST /companies` · `GET /companies[/:id]` | Create a company (from a draft with `planId`, or a preset) → `create_company` + teams. Checks email, slug and wallet balance first; a partial create resumes with only the missing steps |
 | `GET /companies/creation/:slug` · `POST /companies/claim-refund` | On-chain create status (no indexer needed) · claim a deferred refund after a failed create |
-| `POST /plans` · `POST /plans/:id/approve` | Run the planner; turn an approved plan into `assign_task` transactions |
+| `POST /plans` · `GET /plans?companyId=` · `POST /plans/:id/approve` | Run the planner; list a company's plans; turn an approved plan into `assign_task` transactions (routed to the company's matching teams) |
 | `GET /estimate` | Cost per tier (p50, p90, cap) for a task tag and size |
 | `GET /tasks` · `PATCH /tasks/:id` | Task list; change tier or pin a model → `set_task_tier` |
 | `GET /sellers/options?service=` | Up to 3 sellers with live 402 price and a quality note |

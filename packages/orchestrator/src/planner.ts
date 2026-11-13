@@ -117,3 +117,71 @@ export function topoOrder(features: PlanFeature[]): string[] {
   if (out.length !== features.length) throw new Error("plan has a dependency cycle");
   return out;
 }
+
+// ---------- teams ----------
+
+/** The kind of team a task belongs to. Reports, budgets and analytics are grouped by team. */
+export type TeamKind = "build" | "ops" | "growth" | "support";
+const KIND_FOR_TAG: Record<string, TeamKind> = { devops: "ops", growth: "growth", support: "support" };
+export const teamKindForTag = (tag: string): TeamKind => KIND_FOR_TAG[tag] ?? "build";
+
+/** Names a company may have given each kind of team (first match wins). */
+export const TEAM_ALIASES: Record<TeamKind, string[]> = {
+  build: ["build", "eng", "engineering", "dev", "product", "core"],
+  ops: ["ops", "devops", "infra", "platform"],
+  growth: ["growth", "marketing", "sales"],
+  support: ["support", "success", "cs", "community", "growth"],
+};
+
+/**
+ * Which of a company's teams gets a task with this tag. Falls back to the build team, then the first team,
+ * so a company with custom team names (eng/growth/ops/support) still routes every task somewhere sensible.
+ */
+export function pickTeam(tag: string, teamNames: string[]): string | null {
+  if (!teamNames.length) return null;
+  const kind = teamKindForTag(tag);
+  for (const k of [kind, "build" as TeamKind]) for (const alias of TEAM_ALIASES[k]) if (teamNames.includes(alias)) return alias;
+  return teamNames[0];
+}
+
+const DOLLAR = 1_000_000n;
+const roundUpDollars = (micro: bigint) => ((micro + DOLLAR - 1n) / DOLLAR) * DOLLAR;
+
+/**
+ * Company setup suggested by a plan: one team per kind of work in it, each budgeted at its tasks' caps
+ * + 20% headroom (rounded up to whole dollars, at least $5), a per-purchase limit of 5% of the budget
+ * (at least $0.50) and a daily cap of a quarter of the total (at least $10). All amounts micro-USDC.
+ */
+export function suggestSetup(features: PlanFeature[], perFeature: Array<{ key: string; cap: string }>, title: string) {
+  const capOf = new Map(perFeature.map((f) => [f.key, BigInt(f.cap)]));
+  const byTeam = new Map<string, { features: string[]; cap: bigint }>();
+  for (const f of features) {
+    const kind = teamKindForTag(f.tag);
+    const team = kind === "support" ? "growth" : kind; // small companies: support sits with growth
+    const t = byTeam.get(team) ?? { features: [], cap: 0n };
+    t.features.push(f.key);
+    t.cap += capOf.get(f.key) ?? 0n;
+    byTeam.set(team, t);
+  }
+  const order: string[] = ["build", "ops", "growth"];
+  const teams = [...byTeam.entries()]
+    .sort((a, b) => order.indexOf(a[0]) - order.indexOf(b[0]))
+    .map(([team, t]) => {
+      let budget = roundUpDollars((t.cap * 12n) / 10n);
+      if (budget < 5n * DOLLAR) budget = 5n * DOLLAR;
+      let perTx = budget / 20n;
+      if (perTx < DOLLAR / 2n) perTx = DOLLAR / 2n;
+      return { team, monthlyCap: budget.toString(), perTxLimit: perTx.toString(), features: t.features, estimatedCap: t.cap.toString() };
+    });
+  const total = teams.reduce((a, t) => a + BigInt(t.monthlyCap), 0n);
+  let daily = roundUpDollars(total / 4n);
+  if (daily < 10n * DOLLAR) daily = 10n * DOLLAR;
+  const slug =
+    title
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 24)
+      .replace(/-+$/g, "") || "my-company";
+  return { name: title.slice(0, 64), slug: slug.length >= 2 ? slug : `${slug}-co`, dailyCap: daily.toString(), teams, units: "micro-USDC" };
+}

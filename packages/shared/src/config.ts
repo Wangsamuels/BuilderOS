@@ -84,6 +84,19 @@ const EnvSchema = z.object({
   /** YoctoNEAR per drip (default ~6.5 NEAR ≈ lowered create deposits + buffer). */
   TESTNET_SPONSOR_AMOUNT_YOCTO: z.string().optional(),
 
+  // Privy (Google/email sign-in). Used only to verify a Privy identity token's email; sign-in itself is NEP-413.
+  PRIVY_APP_ID: z.string().optional(),
+  /** Privy verification key (PEM, from the Privy dashboard). Without it the JWKS is fetched from Privy. */
+  PRIVY_VERIFICATION_KEY: z.string().optional(),
+  PRIVY_JWKS_URL: z.string().optional(),
+  /** Dev/test only: return the email code in the API response when no email channel is set. Ignored in production. */
+  EMAIL_DEV_ECHO: bool,
+  /** Public read-only sample company at GET /v1/demo (on by default; "0" turns it off). */
+  DEMO_ENABLED: z
+    .string()
+    .optional()
+    .transform((v) => v !== "0" && v !== "false"),
+
   LOG_LEVEL: z.string().default("info"),
 });
 

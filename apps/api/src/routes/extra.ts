@@ -19,6 +19,7 @@ import { planEstimate, topoOrder } from "@builderos/orchestrator";
 import { sha256Hex } from "@builderos/crypto";
 import { accessFor, authorize, departmentScope, requireAccount, requireFounder } from "../auth.js";
 import { parse } from "../app.js";
+import { loadPlan } from "../drafts.js";
 
 /**
  * Routes added for the web app's interior screens. Everything that the contracts can't do yet answers
@@ -236,9 +237,7 @@ export const extraRoutes: FastifyPluginAsync = async (app) => {
     const account = requireAccount(req);
     const body = parse(PatchPlanBody, req.body);
     const db = getDb();
-    const [p] = await db.select().from(plans).where(eq(plans.id, req.params.id));
-    if (!p) throw new HttpError(404, "plan not found", "not_found");
-    await authorize(account, p.companyId, ["builder"]);
+    const { plan: p } = await loadPlan(account, req.params.id); // drafts: author only; launched: builders
     if (p.approvedAt) throw new HttpError(409, "This plan is already approved; its steps are on chain.", "plan_already_approved");
     let features = body.features ?? p.features;
     if (body.removeKeys?.length) {
@@ -257,8 +256,8 @@ export const extraRoutes: FastifyPluginAsync = async (app) => {
     }
     const tier = (body.tier ?? p.tier) as Tier;
     const est = planEstimate(features, tier);
-    const [row] = await db.update(plans).set({ features, estimate: est, tier }).where(eq(plans.id, p.id)).returning();
-    return { plan: { id: row.id, companyId: row.companyId, features: row.features, estimate: row.estimate, tier: row.tier, approvedAt: row.approvedAt } };
+    const [row] = await db.update(plans).set({ features, estimate: est, tier, updatedAt: new Date() }).where(eq(plans.id, p.id)).returning();
+    return { plan: { id: row.id, companyId: row.companyId, title: row.title, features: row.features, estimate: row.estimate, tier: row.tier, approvedAt: row.approvedAt, status: row.companyId ? "launched" : "draft" } };
   });
 
   app.get<{ Params: { id: string } }>("/tasks/:id", async (req) => {

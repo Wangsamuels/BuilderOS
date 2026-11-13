@@ -4,6 +4,7 @@ import {
   AgentStatusBody,
   AllowSellerBody,
   CreateCompanyBody,
+  CreateDraftBody,
   CreatePlanBody,
   RegisterAgentBody,
   EstimateQuery,
@@ -14,17 +15,18 @@ import {
   env,
   type UnsignedTx,
 } from "@builderos/shared";
-import { agents, and, companies, departments, desc, eq, getDb, hires, inArray, plans, sellerOptions, tasks } from "@builderos/db";
-import { batchLimits, companyAccount, companySlug, companyCreateFunding, departmentAccount, teamEvmConfig, tx, viewAccount, views, yoctoToNear } from "@builderos/near";
+import { agents, and, companies, departments, desc, eq, getDb, hires, inArray, isNull, plans, sellerOptions, tasks } from "@builderos/db";
+import { batchLimits, companyAccount, companySlug, companyCreateFunding, departmentAccount, splitDepartment, teamEvmConfig, tx, viewAccount, views, yoctoToNear } from "@builderos/near";
 import { estimate, type Tier } from "@builderos/router";
-import { listHireableAgents, nicheNecessity, HIRE_NECESSITY_MIN, plan as runPlanner, rankHireCandidates, ROLE_FOR_TAG, topoOrder } from "@builderos/orchestrator";
+import { listHireableAgents, nicheNecessity, HIRE_NECESSITY_MIN, pickTeam, plan as runPlanner, rankHireCandidates, ROLE_FOR_TAG, topoOrder } from "@builderos/orchestrator";
 import { parseChallenges, challengeAmount } from "@builderos/rails";
 import { seal, serialize, serverKey } from "@builderos/crypto";
 import { requireZeroDepositForwarding } from "./extra.js";
 import { authorize, companiesFor, departmentScope, linkCompany, requireAccount, requireFounder, visibleCompanies, type Access } from "../auth.js";
 import { parse } from "../app.js";
+import { requireVerifiedEmail } from "../account.js";
+import { bindPendingDrafts, createDraft, draftView, loadPlan } from "../drafts.js";
 
-const DEPT_FOR_TAG: Record<string, string> = { growth: "growth", support: "growth", devops: "ops" };
 
 export const coreRoutes: FastifyPluginAsync = async (app) => {
   // ---------- companies ----------
@@ -50,6 +52,7 @@ export const coreRoutes: FastifyPluginAsync = async (app) => {
       [c] = await db.select().from(companies).where(eq(companies.id, req.params.id));
     }
     await linkCompany(account, req.params.id, "read");
+    if (access.admin) await bindPendingDrafts(account, req.params.id);
     const allowed = departmentScope(access);
     const depts = (await db.select().from(departments).where(eq(departments.companyId, req.params.id))).filter(
       (d) => !allowed || allowed.includes(d.id),
@@ -75,6 +78,16 @@ export const coreRoutes: FastifyPluginAsync = async (app) => {
     const account = requireAccount(req);
     const body = parse(CreateCompanyBody, req.body);
     const companyId = companyAccount(body.slug);
+    // Launching a draft: its suggested teams, budgets and daily cap fill whatever the request left out.
+    let draft: Awaited<ReturnType<typeof loadPlan>>["plan"] | null = null;
+    if (body.planId) {
+      draft = (await loadPlan(account, body.planId)).plan;
+      if (draft.companyId && draft.companyId !== companyId)
+        throw new HttpError(409, "This draft already belongs to another company.", "draft_already_launched", { companyId: draft.companyId });
+      const setup = (await draftView(draft)).suggestedSetup;
+      if (!body.teamsGiven) body.departments = setup.teams.map((t) => ({ name: t.team, budget: t.monthlyCap, perTxLimit: t.perTxLimit }));
+      if (!body.dailyCapGiven) body.dailyCap = setup.dailyCap;
+    }
     for (const d of body.departments)
       if (departmentAccount(companyId, d.name).length > 64) throw new HttpError(400, `"${d.name}" + slug is too long for a NEAR account id`, "invalid_request");
 
@@ -84,6 +97,11 @@ export const coreRoutes: FastifyPluginAsync = async (app) => {
     if (state.slugTaken && !state.companyExists)
       throw new HttpError(409, "This company is still being created on chain. Check again in a few seconds.", "create_in_progress");
     if (!state.slugTaken && state.companyExists) throw new HttpError(409, `"${body.slug}" is taken — pick another company name`, "slug_taken");
+    // A new company needs a founder we can reach (approvals, security alerts). Resuming one already started doesn't.
+    if (!state.slugTaken) await requireVerifiedEmail(account);
+    if (draft && !draft.companyId)
+      await getDb().update(plans).set({ launchCompanyId: companyId, updatedAt: new Date() }).where(and(eq(plans.id, draft.id), isNull(plans.companyId)));
+    if (state.companyExists && state.founderIsYou) await bindPendingDrafts(account, companyId);
 
     const presetHash = createHash("sha256").update(body.preset).digest("hex");
     const have = new Set(state.departments.map((d) => d.name));
@@ -96,7 +114,8 @@ export const coreRoutes: FastifyPluginAsync = async (app) => {
     const transactions: UnsignedTx[] = [
       ...(state.slugTaken ? [] : [tx.createCompany({ slug: body.slug, name: body.name, preset: body.preset, dailyCap: body.dailyCap, presetHash })]),
       ...missingDepts.map((d, i) => tx.createDepartment(companyId, { ...d, evm: evm[i] })),
-      ...(state.dailyCap === body.dailyCap ? [] : [tx.setCaps(companyId, { dailyCap: body.dailyCap })]),
+      // create_company already sets the daily cap; only an existing company with a different cap needs set_caps.
+      ...(state.companyExists && state.dailyCap !== body.dailyCap ? [tx.setCaps(companyId, { dailyCap: body.dailyCap })] : []),
     ];
 
     // Exact cost of what's left to sign: storage deposits + ~0.05 NEAR gas per tx.
@@ -117,11 +136,14 @@ export const coreRoutes: FastifyPluginAsync = async (app) => {
       transactions,
       resumed: state.slugTaken,
       complete: transactions.length === 0,
-      missing: { company: !state.slugTaken, departments: missingDepts.map((d) => d.name), caps: state.dailyCap !== body.dailyCap },
+      missing: { company: !state.slugTaken, departments: missingDepts.map((d) => d.name), caps: state.companyExists && state.dailyCap !== body.dailyCap },
       /** Poll after signing: confirms the company + teams exist on chain (a failed create is refunded, not "success"). */
       verify: `/v1/companies/creation/${body.slug}`,
       funding: companyCreateFunding(body.departments.length),
       requiredYocto: required.toString(),
+      teams: body.departments,
+      dailyCap: body.dailyCap,
+      ...(draft ? { planId: draft.id, next: `POST /v1/plans/${draft.id}/approve (after the company is on chain)` } : {}),
     };
   });
 
@@ -132,8 +154,12 @@ export const coreRoutes: FastifyPluginAsync = async (app) => {
     if (!/^[a-z0-9-]{2,32}$/.test(slug)) throw new HttpError(400, "invalid slug", "invalid_request");
     const st = await creationState(slug, account);
     if (st.slugTaken && !st.founderIsYou) return { slug, slugTaken: true, founderIsYou: false };
-    if (st.founderIsYou && st.companyExists) await linkCompany(account, st.companyId, "creation");
-    return st;
+    let plansBound: string[] = [];
+    if (st.founderIsYou && st.companyExists) {
+      await linkCompany(account, st.companyId, "creation");
+      plansBound = await bindPendingDrafts(account, st.companyId);
+    }
+    return { ...st, plansBound };
   });
 
   /** Factory couldn't refund a failed create right away → founder signs claim_refund. */
@@ -145,39 +171,58 @@ export const coreRoutes: FastifyPluginAsync = async (app) => {
   });
 
   // ---------- planner ----------
+  /**
+   * With `companyId`: a plan inside that company (builder scope). Without: a private draft for the caller
+   * (same as POST /v1/drafts) — no company needed to describe a product.
+   */
   app.post("/plans", async (req) => {
     const account = requireAccount(req);
-    const body = parse(CreatePlanBody, req.body);
+    const raw = (req.body ?? {}) as Record<string, unknown>;
+    if (!raw.companyId) {
+      const d = parse(CreateDraftBody, raw);
+      const row = await createDraft(account, d);
+      return { plan: { id: row.id, companyId: null, features: row.features, estimate: row.estimate, tier: row.tier, title: row.title, status: "draft" }, draft: await draftView(row) };
+    }
+    const body = parse(CreatePlanBody, raw);
     await authorize(account, body.companyId, ["builder"]);
     const result = await runPlanner(body.description, body.tier as Tier);
     topoOrder(result.features); // rejects cycles
     // Private by default: the plan text is sealed before it's written.
     const sealed = serialize(await seal(body.description, serverKey(env().SESSION_SECRET), 0, body.companyId));
+    const title = body.description.split(/[.\n]/)[0].trim().slice(0, 80) || "Plan";
     const [row] = await getDb()
       .insert(plans)
-      .values({ companyId: body.companyId, description: sealed, keyVersion: 0, features: result.features, estimate: result.estimate, tier: body.tier, createdBy: account })
+      .values({ companyId: body.companyId, title, description: sealed, keyVersion: 0, features: result.features, estimate: result.estimate, tier: body.tier, createdBy: account, launchedAt: new Date() })
       .returning();
-    return { plan: { id: row.id, companyId: row.companyId, features: row.features, estimate: row.estimate, tier: row.tier } };
+    return { plan: { id: row.id, companyId: row.companyId, features: row.features, estimate: row.estimate, tier: row.tier, title: row.title, status: "launched" } };
   });
 
   app.get<{ Params: { id: string } }>("/plans/:id", async (req) => {
     const account = requireAccount(req);
-    const [p] = await getDb().select().from(plans).where(eq(plans.id, req.params.id));
-    if (!p) throw new HttpError(404, "plan not found");
-    const access = await authorize(account, p.companyId, ["builder"]);
-    const allowed = departmentScope(access);
+    const { plan: p, access } = await loadPlan(account, req.params.id);
+    if (!p.companyId) return { plan: await draftView(p, { withDescription: true }), tasks: [] };
+    const allowed = access ? departmentScope(access) : null;
     const t = (await getDb().select().from(tasks).where(eq(tasks.planId, p.id))).filter((x) => !allowed || (x.departmentId && allowed.includes(x.departmentId)));
     const { description: _sealed, ...rest } = p;
-    return { plan: rest, tasks: t };
+    return { plan: { ...rest, status: "launched" }, tasks: t };
   });
 
   /** Approve a plan → task rows (DAG) + assign_task transactions. Tasks start once the contract emits task_assigned. */
   app.post<{ Params: { id: string } }>("/plans/:id/approve", async (req) => {
     const account = requireAccount(req);
     const db = getDb();
-    const [p] = await db.select().from(plans).where(eq(plans.id, req.params.id));
-    if (!p) throw new HttpError(404, "plan not found");
-    await authorize(account, p.companyId, ["admin"]);
+    let { plan: p } = await loadPlan(account, req.params.id, ["admin"]);
+    if (!p.companyId && p.launchCompanyId) {
+      // Launched as a new company: bind it now if the chain already shows that company.
+      await bindPendingDrafts(account, p.launchCompanyId);
+      ({ plan: p } = await loadPlan(account, req.params.id, ["admin"]));
+    }
+    if (!p.companyId)
+      throw new HttpError(409, "Launch this draft into a company before approving it.", "plan_not_launched", {
+        how: ["POST /v1/companies { name, slug, planId }", "POST /v1/drafts/:id/launch { companyId }"],
+        launchCompanyId: p.launchCompanyId,
+      });
+    const companyId: string = p.companyId;
     // Approval is recorded before the founder signs. If signing was cancelled or refused, the tasks are still
     // "pending" (no task_assigned seen yet), so hand back the same assign_task calls instead of a dead-end 409.
     // Re-sending is safe: assign_task overwrites the task with identical values.
@@ -189,22 +234,24 @@ export const coreRoutes: FastifyPluginAsync = async (app) => {
       const order = topoOrder(pending.map((r) => ({ key: r.id, dependsOn: r.dependsOn.filter((d) => byId.get(d)?.status === "pending") })) as any);
       const calls = order.map((id) => {
         const r = byId.get(id)!;
-        return tx.assignTaskCall(r.departmentId ?? `build.${p.companyId}`, { taskId: r.id, tier: r.tier ?? p.tier, cap: r.cap ?? "0", tag: r.tag, agentRole: ROLE_FOR_TAG[r.tag] ?? "backend", dependsOn: r.dependsOn });
+        return tx.assignTaskCall(r.departmentId ?? `build.${companyId}`, { taskId: r.id, tier: r.tier ?? p.tier, cap: r.cap ?? "0", tag: r.tag, agentRole: ROLE_FOR_TAG[r.tag] ?? "backend", dependsOn: r.dependsOn });
       });
-      const { deptCallsPerTx } = await batchLimits(p.companyId);
-      const transactions = tx.deptCalls(p.companyId, calls, deptCallsPerTx).map((t) => ({ ...t, signerId: account }));
+      const { deptCallsPerTx } = await batchLimits(companyId);
+      const transactions = tx.deptCalls(companyId, calls, deptCallsPerTx).map((t) => ({ ...t, signerId: account }));
       return { tasks: pending, transactions, resumed: true };
     }
 
-    let depts = await db.select().from(departments).where(eq(departments.companyId, p.companyId));
+    let depts = await db.select().from(departments).where(eq(departments.companyId, companyId));
     if (!depts.length) {
-      await syncCompanyFromChain(p.companyId);
-      depts = await db.select().from(departments).where(eq(departments.companyId, p.companyId));
+      await syncCompanyFromChain(companyId);
+      depts = await db.select().from(departments).where(eq(departments.companyId, companyId));
     }
     if (!depts.length) throw new HttpError(409, "company has no teams on chain yet — finish company setup first", "no_teams");
+    // Route each task to the company's matching team (works with custom names like eng/growth/ops/support).
+    const names = depts.map((d) => d.name ?? splitDepartment(d.id).name);
     const deptFor = (tag: string) => {
-      const want = DEPT_FOR_TAG[tag] ?? "build";
-      return (depts.find((d) => d.name === want) ?? depts[0]).id;
+      const want = pickTeam(tag, names);
+      return (depts.find((d) => (d.name ?? splitDepartment(d.id).name) === want) ?? depts[0]).id;
     };
     const order = topoOrder(p.features);
     const short = p.id.slice(0, 8);
@@ -221,7 +268,7 @@ export const coreRoutes: FastifyPluginAsync = async (app) => {
       return {
         id: idOf(key),
         planId: p.id,
-        companyId: p.companyId,
+        companyId,
         departmentId,
         title: f.title,
         tag: f.tag,
@@ -241,8 +288,8 @@ export const coreRoutes: FastifyPluginAsync = async (app) => {
       await t.update(plans).set({ approvedAt: new Date() }).where(eq(plans.id, p.id));
     });
     // assign_task goes through company.dept_call (departments only accept the company as caller).
-    const { deptCallsPerTx } = await batchLimits(p.companyId);
-    const transactions: UnsignedTx[] = tx.deptCalls(p.companyId, calls, deptCallsPerTx).map((t) => ({ ...t, signerId: account }));
+    const { deptCallsPerTx } = await batchLimits(companyId);
+    const transactions: UnsignedTx[] = tx.deptCalls(companyId, calls, deptCallsPerTx).map((t) => ({ ...t, signerId: account }));
     return { tasks: rows, transactions, resumed: false };
   });
 
