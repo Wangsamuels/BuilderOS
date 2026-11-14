@@ -12,9 +12,24 @@ Built for **NEAR HACKATHON** (1–14 Nov 2026). Status: **NEAR testnet**, with a
 | Frontend | https://github.com/Wangsamuels/BuilderOS-frontend |
 | Hosted app | https://builder-os-eight.vercel.app |
 | Hosted API | https://builderos-api-sam-77caab77f14e.herokuapp.com (`/health`, `/v1/demo`) |
-| Tracks | `agents`, `swarms`, `business` |
+| Tracks | `business`, `agents`, `swarms`, `security`, `defi`, `privacy`, `realworld`, `open` (how each one fits: [Tracks](#tracks)) |
 | Submission tag | `hackathon-submission` (in both repos) |
 | Other project by the same author (rule Q-015) | **Kronos**, a security layer for DeFi lending that blocks transactions breaking a protocol's rules and puts risky admin changes behind a public timelock: https://github.com/Wangsamuels/Kronos-backend. Independent project, separate codebase, separate submission. |
+
+---
+
+## Tracks
+
+| Track | Where it is in BuilderOS |
+|---|---|
+| `business` Autonomous Business | A company is an on-chain treasury with teams that plan, buy services and models, and ship; the founder only sets budgets, caps and approvals. |
+| `agents` Agent Economy | Agents pay per call for NEAR AI models and x402 APIs through `@builderos/fetch`, hire specialist agents from the registry, and post bounties. |
+| `swarms` AI Swarms | A plan becomes a task graph shared by role agents (build, review, buyer, controller); purchases are coordinated per team and settled on chain. |
+| `security` AI Security & Defense | Contract-enforced spending limits, allow-listed payees, daily caps and approvals; agents hold request-only keys and no one holds a full-access key to a company or team. |
+| `defi` Unstoppable DeFi | The company treasury sits in NEAR Intents; withdrawals settle cross-chain through 1Click with no custodian (mainnet path, simulated in tests). |
+| `privacy` Privacy & Private AI | Code, prompts, plans and logs are encrypted; keys are wrapped per member and released only after an on-chain grant check; only hashes go on chain. |
+| `realworld` Real-World Money | USDC budgets per team, deposit addresses, a ledger with CSV export, receipts for every payment, and withdrawals to any major chain. |
+| `open` Open Innovation | An operating system for AI-run companies: describe a product, and a contract-governed company builds it. |
 
 ---
 
