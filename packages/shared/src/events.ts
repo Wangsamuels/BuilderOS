@@ -45,6 +45,7 @@ export const EventSchemas = {
   topup_requested: z.looseObject({ department_id: z.string(), amount, job_id: z.string() }),
   topup_recorded: z.looseObject({ department_id: z.string(), job_id: z.string(), amount_in: amount, amount_out: amount, fees: opt(amount), quote_id: opt(z.string()), origin_tx: opt(z.string()), dest_tx: opt(z.string()), token: opt(z.string()) }),
   withdrawal_requested: z.looseObject({ company_id: z.string(), withdrawal_id: z.string(), amount, token: z.string(), to: z.string() }),
+  withdrawal_failed: z.looseObject({ company_id: z.string(), withdrawal_id: z.string(), amount: opt(amount), reason: opt(z.string()) }),
   withdrawal_recorded: z.looseObject({ company_id: z.string(), withdrawal_id: z.string(), amount_in: opt(amount), amount_out: amount, fees: opt(amount), quote_id: opt(z.string()), origin_tx: opt(z.string()), dest_tx: opt(z.string()), token: opt(z.string()) }),
   float_set: z.looseObject({ department_id: z.string(), rail: z.string(), target: opt(amount) }),
 

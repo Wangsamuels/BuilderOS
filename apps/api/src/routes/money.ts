@@ -1,7 +1,8 @@
 import type { FastifyPluginAsync } from "fastify";
 import { randomUUID } from "node:crypto";
 import { DecideApprovalBody, FreezeBody, HttpError, LedgerQuery, MONEY_RECEIPT_KINDS, TempoFloatBody, WithdrawalBody, toBig, type UnsignedTx } from "@builderos/shared";
-import { and, approvalCards, departments, desc, eq, getDb, inArray, keyAccessLog, lt, railFloats, receipts, sql } from "@builderos/db";
+import { and, approvalCards, departments, desc, eq, getDb, inArray, keyAccessLog, lt, railFloats, receipts, sql, withdrawals } from "@builderos/db";
+import { intentsUsdcBalance, planWithdrawalRoute, type WithdrawalRoute } from "@builderos/bridge";
 import { batchLimits, tx, view, views } from "@builderos/near";
 import { requireZeroDepositForwarding } from "./extra.js";
 import { authorize, departmentScope, requireAccount, requireFounder } from "../auth.js";
@@ -144,33 +145,65 @@ export const moneyRoutes: FastifyPluginAsync = async (app) => {
   });
 
   // ---------- withdrawals ----------
-  /** Plan a withdrawal (sources, quote, fees) → request_withdrawal transaction. Founder only. */
+  /**
+   * Plan a withdrawal from the company's NEAR Intents balance → the `request_withdrawal` transaction.
+   * Founder only. The founder's signature is what moves the money: the contract transfers the funds inside
+   * Intents in that transaction. To a NEAR account they go straight there; to another chain they go to the
+   * one-time account of a committed 1Click quote, which delivers USDC to `to` (or refunds the company).
+   *
+   * NEAR Intents exists on mainnet only, so on testnet the balance reads 0 and this answers `insufficient_funds`.
+   */
   app.post("/withdrawals", async (req) => {
     const account = requireAccount(req);
     const body = parse(WithdrawalBody, req.body);
     await requireFounder(account, body.companyId);
-    const db = getDb();
-    const intents = toBig(
-      await view<string>(process.env.NETWORK === "mainnet" ? "intents.near" : "intents.testnet", "mt_balance_of", {
-        account_id: body.companyId,
-        token_id: process.env.NETWORK === "mainnet" ? "nep141:17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1" : "nep141:usdc.fakes.testnet",
-      }).catch(() => "0"),
-    );
-    const floats = await db
-      .select()
-      .from(railFloats)
-      .where(and(eq(railFloats.rail, "tempo"), inArray(railFloats.departmentId, sql`(select id from departments where company_id = ${body.companyId})`)));
-    const tempoFree = floats.reduce((a, f) => a + (toBig(f.balance) - toBig(f.reserved) > 0n ? toBig(f.balance) - toBig(f.reserved) : 0n), 0n);
+    if (body.token.toLowerCase() !== "usdc") throw new HttpError(400, "Only USDC can be withdrawn.", "invalid_request");
+    const to = body.to.trim();
+    const ok = body.chain === "near" ? /^(([a-z\d]+[-_])*[a-z\d]+\.)*([a-z\d]+[-_])*[a-z\d]+$/.test(to) && to.length >= 2 && to.length <= 64 : body.chain === "solana" ? /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(to) : /^0x[0-9a-fA-F]{40}$/.test(to);
+    if (!ok) throw new HttpError(400, `"${to}" isn't a valid ${body.chain} address.`, "invalid_request");
+
     const want = toBig(body.amount);
-    if (want > intents + tempoFree) throw new HttpError(409, `only ${intents + tempoFree} available (reserved funds are excluded)`, "insufficient_funds");
-    const sources = [
-      { from: "intents", amount: (want < intents ? want : intents).toString() },
-      ...(want > intents ? [{ from: "tempo", amount: (want - intents).toString(), estFee: ((want - intents) / 200n).toString() }] : []),
-    ];
+    if (want <= 0n) throw new HttpError(400, "amount must be above zero", "invalid_request");
+    const available = await intentsUsdcBalance(body.companyId);
+    if (want > available) throw new HttpError(409, `only ${available} available (reserved funds are excluded)`, "insufficient_funds", { available: available.toString() });
+
+    // Before version 4 the contract only announced a withdrawal and moved nothing; never build that transaction.
+    const lim = await batchLimits(body.companyId);
+    if (!lim.intentsWithdrawals)
+      throw new HttpError(409, `This company runs contract version ${lim.version}; withdrawals need version 4. The founder must upgrade the company contract first.`, "contract_upgrade_required", {
+        feature: "withdrawals",
+        currentVersion: lim.version,
+        requiredVersion: 4,
+        how: "propose_upgrade(target \"company\", sha256 of contracts/wasm/company.wasm) → wait 24 h → apply_upgrade with the wasm as raw input",
+      });
+
+    let route: WithdrawalRoute;
+    try {
+      route = await planWithdrawalRoute({ companyId: body.companyId, amount: body.amount, to, chain: body.chain });
+    } catch (e: any) {
+      req.log.warn({ err: e?.message }, "withdrawal quote failed");
+      throw new HttpError(503, "Couldn't get a quote for this withdrawal right now. Nothing was moved; try again in a minute.", "unavailable");
+    }
     const withdrawalId = randomUUID();
+    const sources = [{ from: "intents", amount: body.amount }];
+    await getDb().insert(withdrawals).values({ id: withdrawalId, companyId: body.companyId, amount: body.amount, token: body.token, to, chain: body.chain, status: "quoted", sources });
     return {
-      plan: { withdrawalId, amount: body.amount, token: body.token, to: body.to, chain: body.chain, sources, available: { intents: intents.toString(), tempoUnreserved: tempoFree.toString() } },
-      transaction: tx.requestWithdrawal(body.companyId, { withdrawalId, amount: body.amount, token: body.token, to: body.to, chain: body.chain }),
+      plan: {
+        withdrawalId,
+        amount: body.amount,
+        token: body.token,
+        to,
+        chain: body.chain,
+        route: route.route,
+        sources: [{ ...sources[0], estFee: route.fees }],
+        available: { intents: available.toString(), tempoUnreserved: "0" },
+        /** What arrives and until when the quote holds. `deadline` is null for a straight NEAR withdrawal. */
+        quote: { amountOut: route.amountOut, fees: route.fees, deadline: route.deadline, quoteId: route.quoteId, depositAddress: route.depositAddress, destinationAsset: route.destinationAsset },
+      },
+      transaction: {
+        ...tx.requestWithdrawal(body.companyId, { withdrawalId, amount: body.amount, token: body.token, to, chain: body.chain, route: route.route, tokenId: route.tokenId, depositAddress: route.depositAddress, quoteId: route.quoteId }),
+        signerId: account,
+      },
     };
   });
 

@@ -163,7 +163,7 @@ If the chain create fails (for example someone took the slug first), the draft s
 | `GET /v1/floats/tempo?companyId=` | ✅ | view | → `{ floats: [{ department_id, name, target, balance, reserved, enabled, paused, topups_today, updated_at, in_flight }] }` (one row per team; null fields = no float yet) |
 | `PATCH /v1/floats/tempo` | ✅ | admin | `{ departmentId, target, enabled }` → `{ transaction }` |
 | `POST /v1/floats/top-up` | ⛔ | — | 501, replacement `PATCH /v1/floats/tempo` (the bridge tops up automatically) |
-| `POST /v1/withdrawals` | 🟡 | founder | `{ companyId, amount, token="usdc", to, chain="near"\|"base"\|"ethereum"\|"arbitrum"\|"solana" }` → `{ plan: { withdrawalId, sources, available }, transaction }`. **Testnet: 409 `insufficient_funds`**, because the treasury is NEAR Intents (not on testnet). |
+| `POST /v1/withdrawals` | 🟡 | founder | `{ companyId, amount, token="usdc", to, chain="near"\|"base"\|"ethereum"\|"arbitrum"\|"solana" }` → `{ plan: { withdrawalId, amount, token, to, chain, route: "near"\|"swap", sources:[{from:"intents", amount, estFee}], available:{intents}, quote:{ amountOut, fees, deadline, quoteId, depositAddress, destinationAsset } }, transaction }`. The transaction is the founder's `request_withdrawal`; signing it moves the funds (see *Withdrawals* below). Errors: 409 `insufficient_funds` (`details.available`), 409 `contract_upgrade_required` (company below contract version 4), 503 `unavailable` (no quote right now), 400 bad address for the chain. **Testnet: 409 `insufficient_funds`**, because the treasury is NEAR Intents (not on testnet). |
 | `POST /v1/withdraw/quote` | ⛔ | — | 501, replacement `POST /v1/withdrawals` (the plan is the quote) |
 | `GET /v1/revenue?companyId=` | ✅ **new** | admin | → `{ total, units, receipts }` |
 | `GET /v1/services` · `POST /v1/services/:id/cancel` | 🗓 | — | 501 planned |
@@ -254,12 +254,21 @@ If the chain create fails (for example someone took the slug first), the draft s
 
 ---
 
+### Withdrawals
+
+1. `POST /v1/withdrawals` checks the company's USDC in NEAR Intents (`mt_balance_of`), picks the route and, for another chain, commits a 1Click quote (`quote.deadline` is how long it holds, about 20 minutes). The row is saved as `quoted`. Nothing has moved.
+2. The founder signs `transaction`. The company contract (version 4) transfers the funds inside Intents in that same transaction: `route "near"` → `ft_withdraw` to the NEAR account `to`; `route "swap"` → `mt_transfer` to the quote's one-time `depositAddress`. A withdrawal id can be used once.
+3. If the transfer worked the contract emits `withdrawal_requested`; if not it emits `withdrawal_failed`, nothing left the company and the same plan can be signed again.
+4. The worker follows a swap on 1Click and writes the outcome on chain (`record_withdrawal` → `withdrawal_recorded`): `done` (with `amount_out`, `fees`, `dest_tx`), `refunded` (1Click returned the funds to the company) or `failed`. That entry is what `GET /v1/ledger?kind=withdrawal` shows. The worker's key can record; it cannot pay.
+
+SSE: `withdrawal_requested`, `withdrawal_failed`, `withdrawal_recorded`.
+
 ## 3. Known limits (honest status)
 
 - **Invitees need a little NEAR for gas.** On testnet a brand-new wallet has 0 NEAR and can't sign `accept_invite` until it holds some, e.g. 0.1 NEAR; `POST /v1/auth/fund-testnet` covers founders only.
 - **Reports from real model runs** are written by the task runner, which pays models through Base USDC. They appear once a team is funded and has agents.
 
-- **Company-level deposit and withdrawals** need NEAR Intents, which isn't on testnet. On testnet, teams are funded directly at their Base Sepolia USDC addresses.
+- **Company-level deposit and withdrawals** need NEAR Intents, which isn't on testnet. The mainnet path is implemented and covered by `tests/e2e/intents.mts` against simulated Intents and 1Click. On testnet, teams are funded directly at their Base Sepolia USDC addresses.
 - **Changing per-purchase / auto-approve limits** after create isn't possible in the contracts. Changing it would need a contract change plus the 24 h upgrade.
 - **Companies on contract v2** (created before the next factory redeploy) can't use allow-seller, team budget raise or payment re-configure until upgraded. The upgrade is `propose_upgrade` → wait 24 h → `apply_upgrade` (raw wasm input).
 - **Team-limited approvers:** company contract v3 (next factory redeploy) also enforces the approver's team on chain. On v2 companies only the API enforces it.

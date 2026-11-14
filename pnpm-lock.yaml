@@ -44,6 +44,9 @@ importers:
 
   apps/api:
     dependencies:
+      '@builderos/bridge':
+        specifier: workspace:*
+        version: link:../../packages/bridge
       '@builderos/crypto':
         specifier: workspace:*
         version: link:../../packages/crypto

@@ -1,5 +1,5 @@
 import { env, type Logger } from "@builderos/shared";
-import { QUEUES, companies, eq, getDb, invites, tasks } from "@builderos/db";
+import { QUEUES, companies, eq, getDb, invites, tasks, withdrawals } from "@builderos/db";
 import type { IndexedEvent } from "@builderos/indexer";
 import { resumeForRequest } from "@builderos/orchestrator";
 import { alertFor, type Alert } from "@builderos/notify";
@@ -40,7 +40,19 @@ export async function handleEvent(e: IndexedEvent, deps: EventDeps) {
       await resumeForRequest(d.request_id, log);
       break;
     case "withdrawal_requested":
-      await send(QUEUES.bridgeWithdraw, { withdrawalId: d.withdrawal_id, companyId: d.company_id, amount: String(d.amount), token: d.token, to: d.to, chain: d.chain }, { singletonKey: d.withdrawal_id });
+      // Emitted by the company contract only after the founder's transaction moved the funds inside Intents.
+      // The chain is the truth: the money moved, whatever an earlier failed attempt left on the row.
+      await getDb().update(withdrawals).set({ status: "requested" }).where(eq(withdrawals.id, d.withdrawal_id));
+      await send(
+        QUEUES.bridgeWithdraw,
+        { withdrawalId: d.withdrawal_id, companyId: d.company_id, amount: String(d.amount), token: d.token, to: d.to, chain: d.chain, route: d.route ?? null, depositAddress: d.deposit_address ?? null, quoteId: d.quote_id ?? null, nearTx: e.nearTx ?? null },
+        { singletonKey: d.withdrawal_id },
+      );
+      break;
+    case "withdrawal_failed":
+      // The Intents transfer didn't go through, so nothing left the company. Close the plan and tell the founder.
+      await getDb().update(withdrawals).set({ status: "failed" }).where(eq(withdrawals.id, d.withdrawal_id));
+      await send(QUEUES.notify, { alert: { kind: "info", companyId: d.company_id, title: "Withdrawal didn't go through", body: "Nothing left the company. Check the balance and try again." } satisfies Alert });
       break;
     case "grant_revoked": {
       if (!e.companyId) break;

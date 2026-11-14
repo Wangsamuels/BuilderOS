@@ -240,10 +240,30 @@ app.get("/bridge/requests/v3", async (req) => mockRelayStatus(String((req.query 
 app.get("/bridge/intents/status/v3", async (req) => mockRelayStatus(String((req.query as any).requestId ?? (req.query as any).id ?? "")));
 
 // ---- 1Click mock ----
+const swaps = new Map<string, { amountIn: string; amountOut: string; at: number }>();
+app.get("/oneclick/v0/tokens", async () => [
+  { assetId: "nep141:17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1", blockchain: "near", symbol: "USDC", decimals: 6 },
+  { assetId: "nep141:base-0x833589fcd6edb6e08f4c7c32d4f71b54bda02913.omft.near", blockchain: "base", symbol: "USDC", decimals: 6 },
+  { assetId: "nep141:eth-0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48.omft.near", blockchain: "eth", symbol: "USDC", decimals: 6 },
+  { assetId: "nep141:arb-0xaf88d065e77c8cc2239327c5edb3a432268e5831.omft.near", blockchain: "arb", symbol: "USDC", decimals: 6 },
+  { assetId: "nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near", blockchain: "sol", symbol: "USDC", decimals: 6 },
+]);
 app.post("/oneclick/v0/quote", async (req) => {
   const b = req.body as any;
   const fee = (BigInt(b.amount ?? "0") / 2000n).toString();
-  return { correlationId: randomBytes(8).toString("hex"), quote: { depositAddress: `0x${randomBytes(20).toString("hex")}`, amountIn: b.amount, amountOut: (BigInt(b.amount) - BigInt(fee)).toString() } };
+  const amountOut = (BigInt(b.amount) - BigInt(fee)).toString();
+  // depositType INTENTS → a one-time NEAR implicit account; otherwise an address on the origin chain
+  const depositAddress = b.depositType === "INTENTS" ? randomBytes(32).toString("hex") : `0x${randomBytes(20).toString("hex")}`;
+  if (!b.dry) swaps.set(depositAddress, { amountIn: String(b.amount), amountOut, at: Date.now() });
+  return { correlationId: randomBytes(8).toString("hex"), quote: { depositAddress, amountIn: b.amount, amountOut, deadline: b.deadline } };
+});
+app.post("/oneclick/v0/deposit/submit", async () => ({ status: "PROCESSING" }));
+/** A mock swap settles ten seconds after its quote. */
+app.get("/oneclick/v0/status", async (req, reply) => {
+  const s = swaps.get(String((req.query as any).depositAddress ?? ""));
+  if (!s) return reply.code(404).send({ message: "deposit address not found" });
+  const done = Date.now() - s.at > 10_000;
+  return { status: done ? "SUCCESS" : "PROCESSING", swapDetails: { amountIn: s.amountIn, amountOut: done ? s.amountOut : null, destinationChainTxHashes: done ? [{ hash: `0x${randomBytes(32).toString("hex")}` }] : [] } };
 });
 
 // ---- near-email mock ----

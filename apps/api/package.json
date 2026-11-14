@@ -10,6 +10,7 @@
     "typecheck": "tsc -p ."
   },
   "dependencies": {
+    "@builderos/bridge": "workspace:*",
     "@builderos/crypto": "workspace:*",
     "@builderos/db": "workspace:*",
     "@builderos/fetch": "workspace:*",

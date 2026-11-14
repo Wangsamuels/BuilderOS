@@ -134,7 +134,7 @@ TypeScript, Node 22, pnpm workspaces (hoisted), turbo, esbuild bundles (`scripts
 | `packages/rails` | 402 challenge parsing (x402 EVM/NEAR, MPP Tempo), payment headers, payee-mismatch guard. |
 | `packages/keys` | Wrapped code/log keys: upload (founder, version must match chain), release after an on-chain grant check, delete on revoke. |
 | `packages/crypto` | libsodium sealing, server key, hashing. |
-| `packages/bridge` | 1Click + Relay quotes, Tempo top-ups, withdrawals. |
+| `packages/bridge` | 1Click + Relay quotes, Tempo top-ups, withdrawal routing (`planWithdrawalRoute`) and follow-up (`runWithdrawal`). |
 | `packages/verifier` | Verifies foreign-chain receipts, submits verdicts. |
 | `packages/notify` | In-app, web push, email alerts. |
 
@@ -279,5 +279,5 @@ The full matrix (status, auth, shapes, errors) is in [`API-CONTRACT.md`](./API-C
 | Indexer | ✅ caught up; runs in tx-index fallback on the free tier (~35–60 s behind) |
 | Contract v3 (allow-seller, budget raise, payment re-config, approver team check) | ✅ in source and tests; live for new companies after the factory redeploy |
 | Agent purchases end to end (agent key → Chain Signatures → seller paid on Base) | 🟡 contract and client paths built and unit-tested; needs funded team addresses and registered agents for a live run |
-| Company-level deposit / withdrawals | ⛔ testnet (no NEAR Intents); mainnet design in place |
+| Company-level deposit / withdrawals | ⛔ testnet (no NEAR Intents). Mainnet path implemented: company contract v4 moves Intents funds on the founder's signature, 1Click delivers to other chains, the worker records the outcome. Tested in mainnet mode against simulators (`tests/e2e/intents.mts`); not yet run on real mainnet. |
 | Encrypted file storage, provenance view, leaderboard, services | 🗓 planned (stable 501s) |

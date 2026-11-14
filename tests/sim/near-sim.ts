@@ -49,10 +49,64 @@ export class NearSim {
   /** Every executed tx (hash, signer, status) — the harness feeds these to the indexer. */
   log: Array<{ hash: string; signer: string; height: number; status: any }> = [];
   calls = 0;
+  /**
+   * NEAR Intents (the verifier contract). Null = not deployed, which is the testnet situation: views on it fail
+   * and a withdrawal's transfer fails. Set `intents` to an account id to model mainnet.
+   */
+  intents: string | null = null;
+  /** Intents balances: account → token id → amount. */
+  intentsBalances = new Map<string, Map<string, bigint>>();
+  /** NEAR-side FT balances credited by Intents `ft_withdraw`: account → token contract → amount. */
+  ftBalances = new Map<string, Map<string, bigint>>();
+  /** NEAR accounts registered with a token contract (ft_withdraw to anyone else fails, as on chain). */
+  ftRegistered = new Set<string>();
+  /** Withdrawal ids already used, per company (contract storage `wd:<id>`). */
+  withdrawalIds = new Set<string>();
+  /** Service account allowed to record outcomes (the company's worker_id). */
+  worker = "worker.sim";
   failNextView: string | null = null;
 
   constructor(public factory: string, public mpc = "v1.signer-prod.testnet", public registry = `registry.${factory}`) {
     this.balances.set(factory, 100n * ONE_NEAR);
+  }
+
+  /** Credit an account inside Intents (what `ft_transfer_call` to the Intents contract with msg = account does). */
+  intentsDeposit(account: string, tokenId: string, amount: bigint) {
+    const m = this.intentsBalances.get(account) ?? new Map<string, bigint>();
+    m.set(tokenId, (m.get(tokenId) ?? 0n) + amount);
+    this.intentsBalances.set(account, m);
+  }
+  intentsBalance(account: string, tokenId: string) {
+    return this.intentsBalances.get(account)?.get(tokenId) ?? 0n;
+  }
+  ftBalance(account: string, token: string) {
+    return this.ftBalances.get(account)?.get(token) ?? 0n;
+  }
+  /** Intents `mt_transfer`: move a token between two Intents accounts. Throws like the contract panics. */
+  private mtTransfer(from: string, to: string, tokenId: string, amount: bigint) {
+    if (!this.intents) throw new Error("intents: account does not exist");
+    const have = this.intentsBalance(from, tokenId);
+    if (amount <= 0n || have < amount) throw new Error("intents: insufficient balance");
+    this.intentsBalances.get(from)!.set(tokenId, have - amount);
+    this.intentsDeposit(to, tokenId, amount);
+  }
+  /** Intents `ft_withdraw`: the token leaves Intents to a NEAR account registered with the token contract. */
+  private ftWithdraw(from: string, token: string, receiver: string, amount: bigint) {
+    if (!this.intents) throw new Error("intents: account does not exist");
+    const tokenId = `nep141:${token}`;
+    const have = this.intentsBalance(from, tokenId);
+    if (amount <= 0n || have < amount) throw new Error("intents: insufficient balance");
+    if (!this.ftRegistered.has(`${token}:${receiver}`)) throw new Error("intents: receiver is not registered with the token");
+    this.intentsBalances.get(from)!.set(tokenId, have - amount);
+    const m = this.ftBalances.get(receiver) ?? new Map<string, bigint>();
+    m.set(token, (m.get(token) ?? 0n) + amount);
+    this.ftBalances.set(receiver, m);
+  }
+  /** A call signed by the worker's record-only key (the harness uses it in place of near-api-js). */
+  workerCall(receiver: string, method: string, args: any) {
+    const logs: Array<{ executor: string; log: string }> = [];
+    this.exec(this.worker, receiver, method, args, 0n, logs);
+    return this.agentTx(this.worker, logs, String(args?.withdrawal_id ?? ""));
   }
 
   fund(account: string, near: number) {
@@ -64,6 +118,10 @@ export class NearSim {
     if (account === this.factory) {
       if (method === "get_company") return this.factoryCompanies.get(args.slug) ?? null;
       if (method === "get_pending_refund") return "0";
+      throw new Error("MethodNotFound");
+    }
+    if (this.intents && account === this.intents) {
+      if (method === "mt_balance_of") return this.intentsBalance(args.account_id, args.token_id).toString();
       throw new Error("MethodNotFound");
     }
     if (account === this.registry) {
@@ -103,7 +161,7 @@ export class NearSim {
   }
 
   exists(account: string) {
-    return this.balances.has(account) || this.companies.has(account) || this.depts.has(account);
+    return this.balances.has(account) || this.companies.has(account) || this.depts.has(account) || (this.intents !== null && account === this.intents);
   }
 
   // ---------------- transactions ----------------
@@ -151,6 +209,9 @@ export class NearSim {
     const clone = (c: Company): Company => ({ ...c, depts: [...c.depts], grants: new Map([...c.grants].map(([k, v]) => [k, { ...v }])), invites: new Map(c.invites), pending: new Map(c.pending) });
     return {
       balances: new Map(this.balances),
+      intentsBalances: new Map([...this.intentsBalances].map(([k, v]) => [k, new Map(v)])),
+      ftBalances: new Map([...this.ftBalances].map(([k, v]) => [k, new Map(v)])),
+      withdrawalIds: new Set(this.withdrawalIds),
       factoryCompanies: new Map(this.factoryCompanies),
       companies: new Map([...this.companies].map(([k, v]) => [k, clone(v)])),
       depts: new Map([...this.depts].map(([k, v]) => [k, { ...v, tasks: new Map(v.tasks), agents: new Map(v.agents) }])),
@@ -158,6 +219,9 @@ export class NearSim {
   }
   private restore(s: ReturnType<NearSim["snapshot"]>) {
     this.balances = s.balances;
+    this.intentsBalances = s.intentsBalances;
+    this.ftBalances = s.ftBalances;
+    this.withdrawalIds = s.withdrawalIds;
     this.factoryCompanies = s.factoryCompanies;
     this.companies = s.companies;
     this.depts = s.depts;
@@ -189,7 +253,7 @@ export class NearSim {
         req(deposit >= (75n * ONE_NEAR) / 10n, "attach >= 7.5 NEAR (company wasm storage)");
         const id = `${args.slug}.${this.factory}`;
         this.factoryCompanies.set(args.slug, { company_id: id, founder: signer, name: args.name, preset: args.preset });
-        this.companies.set(id, { id, founder: signer, name: args.name, preset: args.preset, frozen: false, dailyCap: BigInt(args.daily_cap), spentToday: 0n, codeKeyVersion: 0, version: 3, depts: [], grants: new Map(), invites: new Map(), pending: new Map() });
+        this.companies.set(id, { id, founder: signer, name: args.name, preset: args.preset, frozen: false, dailyCap: BigInt(args.daily_cap), spentToday: 0n, codeKeyVersion: 0, version: 4, depts: [], grants: new Map(), invites: new Map(), pending: new Map() });
         this.balances.set(id, deposit);
         this.emit(logs, this.factory, "company_created", { company_id: id, founder: signer, name: args.name, preset: args.preset });
         return;
@@ -255,6 +319,43 @@ export class NearSim {
         oneYocto();
         co.codeKeyVersion = args.version;
         this.emit(logs, co.id, "code_key_rotated", { company_id: co.id, version: args.version });
+        return;
+      case "request_withdrawal": {
+        // contracts/company/src/lib.rs: founder + 1 yocto, single-use id, then the Intents transfer; the
+        // announcement comes from the callback, only when that transfer succeeded.
+        req(founder, "founder only");
+        oneYocto();
+        if (co.version < 4) {
+          // before version 4 the contract announced the request and moved nothing
+          this.emit(logs, co.id, "withdrawal_requested", { company_id: co.id, withdrawal_id: args.withdrawal_id, amount: args.amount, token: args.token, to: args.to, chain: args.chain });
+          return;
+        }
+        req(typeof args.withdrawal_id === "string" && args.withdrawal_id.length > 0 && args.withdrawal_id.length <= 64, "bad withdrawal id");
+        req(/^\d+$/.test(String(args.amount)) && BigInt(args.amount) > 0n, "amount must be a positive integer");
+        req(typeof args.token_id === "string" && args.token_id.startsWith("nep141:") && args.token_id.length > 7, "token_id must be a nep141 Intents token");
+        const key = `${co.id}:${args.withdrawal_id}`;
+        req(!this.withdrawalIds.has(key), "this withdrawal was already requested");
+        req(args.route === "near" || args.route === "swap", "route must be near or swap");
+        if (args.route === "swap") {
+          req(args.deposit_address, "deposit_address is required for a swap");
+          req(args.deposit_address !== co.id, "deposit_address can't be this company");
+        }
+        this.withdrawalIds.add(key);
+        try {
+          if (args.route === "near") this.ftWithdraw(co.id, String(args.token_id).slice("nep141:".length), args.to, BigInt(args.amount));
+          else this.mtTransfer(co.id, args.deposit_address, args.token_id, BigInt(args.amount));
+        } catch {
+          // on_withdrawal_paid with a failed transfer: nothing left the company, the id is released
+          this.withdrawalIds.delete(key);
+          this.emit(logs, co.id, "withdrawal_failed", { company_id: co.id, withdrawal_id: args.withdrawal_id, amount: args.amount, reason: "intents_transfer_failed" });
+          return;
+        }
+        this.emit(logs, co.id, "withdrawal_requested", { company_id: co.id, withdrawal_id: args.withdrawal_id, amount: args.amount, token: args.token, to: args.to, chain: args.chain, route: args.route, token_id: args.token_id, deposit_address: args.deposit_address ?? null, quote_id: args.quote_id ?? null, paid_to: args.route === "near" ? args.to : args.deposit_address });
+        return;
+      }
+      case "record_withdrawal":
+        req(signer === this.worker, "worker only");
+        this.emit(logs, co.id, "withdrawal_recorded", { company_id: co.id, ...args });
         return;
       case "freeze":
         req(founder || this.has(co, signer, []), "founder or admin only");

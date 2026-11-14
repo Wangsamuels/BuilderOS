@@ -62,7 +62,7 @@ export function buildReceipt(event: EventName, d: Record<string, any>, signer: s
         amount: s(d.amount_out),
         token: s(d.token),
         foreignTx: s(d.dest_tx),
-        payload: { amount_in: d.amount_in, amount_out: d.amount_out, fees: d.fees, quote_id: d.quote_id, origin_tx: d.origin_tx, dest_tx: d.dest_tx, withdrawal_id: d.withdrawal_id },
+        payload: { status: d.status, to: d.to, chain: d.chain, amount_in: d.amount_in, amount_out: d.amount_out, fees: d.fees, quote_id: d.quote_id, origin_tx: d.origin_tx, dest_tx: d.dest_tx, withdrawal_id: d.withdrawal_id },
       };
     case "deposit":
       return { kind: "deposit", actor: s(d.payer), amount: s(d.amount), token: s(d.token), payload: { payer: d.payer } };

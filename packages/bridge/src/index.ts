@@ -15,7 +15,28 @@ export const MIN_TOPUP = 10_000_000n; // $10 (USDC 6dp)
 export const MAX_FEE_BPS = 100n; // 1%
 export const MAX_TOPUPS_PER_DAY = 2;
 
-export type Quote = { quoteId: string; amountIn: string; amountOut: string; depositAddress: string; fees: string; steps?: unknown };
+export type Quote = { quoteId: string; amountIn: string; amountOut: string; depositAddress: string; fees: string; deadline?: string | null; steps?: unknown };
+
+/** Chains a founder can withdraw to, and 1Click's name for each. */
+export const WITHDRAWAL_CHAINS = { near: "near", base: "base", ethereum: "eth", arbitrum: "arb", solana: "sol" } as const;
+export type WithdrawalChain = keyof typeof WITHDRAWAL_CHAINS;
+/**
+ * USDC per chain as a 1Click asset id. The live list (GET /v0/tokens) is the source of truth; these are the
+ * known ids, used when that list can't be read.
+ */
+const USDC_ASSET_FALLBACK: Record<WithdrawalChain, string> = {
+  near: "nep141:17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1",
+  base: "nep141:base-0x833589fcd6edb6e08f4c7c32d4f71b54bda02913.omft.near",
+  ethereum: "nep141:eth-0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48.omft.near",
+  arbitrum: "nep141:arb-0xaf88d065e77c8cc2239327c5edb3a432268e5831.omft.near",
+  solana: "nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near",
+};
+let tokenCache: { at: number; byChain: Map<string, string> } | null = null;
+const oneClickHeaders = (): Record<string, string> => {
+  const jwt = env().ONECLICK_JWT;
+  return { "content-type": "application/json", ...(jwt ? { authorization: `Bearer ${jwt}` } : {}) };
+};
+export type SwapStatus = { state: "pending" | "success" | "refunded" | "failed"; raw: string; amountOut: string | null; destTx: string | null };
 
 function relayHeaders(): Record<string, string> {
   const key = env().RELAY_API_KEY;
@@ -34,10 +55,43 @@ export function mapRelayStatus(raw: string | undefined): "pending" | "success" |
 
 /** 1Click (NEAR Intents) + Relay clients. Mesh mock when USE_SELLER_MESH / BRIDGE_MOCK; live Relay when TEMPO_ENABLED. */
 export const bridgeClients = {
-  async oneClickQuote(p: { amount: string; recipient: string; refundTo: string; originAsset: string; destinationAsset: string }): Promise<Quote> {
+  /** USDC on `chain` as a 1Click asset id, read from the live token list (cached for an hour). */
+  async usdcAsset(chain: WithdrawalChain): Promise<string> {
+    if (!tokenCache || Date.now() - tokenCache.at > 3_600_000) {
+      try {
+        const res = await fetch(`${env().ONECLICK_BASE_URL}/v0/tokens`, { headers: oneClickHeaders(), signal: AbortSignal.timeout(10_000) });
+        if (!res.ok) throw new Error(`1click tokens ${res.status}`);
+        const list = (await res.json()) as Array<{ assetId?: string; blockchain?: string; symbol?: string }>;
+        const byChain = new Map<string, string>();
+        for (const t of list) if (t.symbol === "USDC" && t.assetId && t.blockchain && !byChain.has(t.blockchain)) byChain.set(t.blockchain, t.assetId);
+        tokenCache = { at: Date.now(), byChain };
+      } catch {
+        tokenCache = { at: Date.now() - 3_300_000, byChain: new Map() }; // try the live list again in five minutes
+      }
+    }
+    return tokenCache.byChain.get(WITHDRAWAL_CHAINS[chain]) ?? USDC_ASSET_FALLBACK[chain];
+  },
+
+  /** Tell 1Click about the funding transaction so it starts sooner (optional in their flow). */
+  async oneClickSubmitDeposit(p: { depositAddress: string; txHash: string }): Promise<void> {
+    await fetch(`${env().ONECLICK_BASE_URL}/v0/deposit/submit`, { method: "POST", headers: oneClickHeaders(), body: JSON.stringify(p), signal: AbortSignal.timeout(10_000) }).catch(() => undefined);
+  },
+
+  /** Where a swap stands. Terminal: success, refunded (funds returned to the refund account), failed. */
+  async oneClickStatus(depositAddress: string): Promise<SwapStatus> {
+    const res = await fetch(`${env().ONECLICK_BASE_URL}/v0/status?depositAddress=${encodeURIComponent(depositAddress)}`, { headers: oneClickHeaders(), signal: AbortSignal.timeout(15_000) });
+    if (!res.ok) throw new Error(`1click status ${res.status}: ${(await res.text()).slice(0, 200)}`);
+    const j = (await res.json()) as any;
+    const raw = String(j.status ?? "PENDING_DEPOSIT").toUpperCase();
+    const d = j.swapDetails ?? {};
+    const state = raw === "SUCCESS" ? "success" : raw === "REFUNDED" ? "refunded" : raw === "FAILED" ? "failed" : "pending";
+    return { state, raw, amountOut: d.amountOut != null ? String(d.amountOut) : null, destTx: d.destinationChainTxHashes?.[0]?.hash ?? null };
+  },
+
+  async oneClickQuote(p: { amount: string; recipient: string; refundTo: string; originAsset: string; destinationAsset: string; dry?: boolean; deadlineMinutes?: number }): Promise<Quote> {
     const e = env();
     const body = {
-      dry: network().oneClickDry,
+      dry: p.dry ?? network().oneClickDry,
       swapType: "EXACT_INPUT",
       slippageTolerance: 50,
       originAsset: p.originAsset,
@@ -48,11 +102,11 @@ export const bridgeClients = {
       refundType: "INTENTS",
       recipient: p.recipient,
       recipientType: "DESTINATION_CHAIN",
-      deadline: new Date(Date.now() + 30 * 60_000).toISOString(),
+      deadline: new Date(Date.now() + (p.deadlineMinutes ?? 30) * 60_000).toISOString(),
     };
     const res = await fetch(`${e.ONECLICK_BASE_URL}/v0/quote`, {
       method: "POST",
-      headers: { "content-type": "application/json", ...(e.ONECLICK_JWT ? { authorization: `Bearer ${e.ONECLICK_JWT}` } : {}) },
+      headers: oneClickHeaders(),
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(20_000),
     });
@@ -65,6 +119,7 @@ export const bridgeClients = {
       amountOut: String(q.amountOut ?? q.minAmountOut ?? p.amount),
       depositAddress: q.depositAddress ?? "",
       fees: (toBig(q.amountIn ?? p.amount) - toBig(q.amountOut ?? p.amount)).toString(),
+      deadline: q.deadline ?? body.deadline,
     };
   },
 
@@ -199,7 +254,7 @@ export async function runTopup(p: { jobId: string; departmentId: string; amount:
     amount: p.amount,
     recipient: dept.baseAddress,
     refundTo: p.departmentId,
-    originAsset: "nep141:usdc.near",
+    originAsset: network().intents.usdcTokenId,
     destinationAsset: `nep141:base-${network().base.usdc.toLowerCase()}.omft.near`,
   });
   // 2) Base -> Tempo pocket (Relay deposit address)
@@ -252,70 +307,95 @@ export async function runTopup(p: { jobId: string; departmentId: string; amount:
   throw new Error("relay still pending; job will retry");
 }
 
-/** Withdrawal: pause top-ups, pay from Intents USDC first, pull the gap back from Tempo (never reserved funds). */
-export async function runWithdrawal(p: { withdrawalId: string; companyId: string; amount: string; token: string; to: string; chain?: string }, log: Logger) {
-  const db = getDb();
-  const [w] = await db.select().from(withdrawals).where(eq(withdrawals.id, p.withdrawalId));
-  if (w && ["done", "failed"].includes(w.status)) return w;
-  if (!w) await db.insert(withdrawals).values({ id: p.withdrawalId, companyId: p.companyId, amount: p.amount, token: p.token, to: p.to, chain: p.chain, status: "running" }).onConflictDoNothing();
+/* ---------------------------------------------------------------------------------------------------
+ * Withdrawals from NEAR Intents
+ *
+ * The founder's own transaction moves the money: `request_withdrawal` on the company contract transfers the
+ * funds inside Intents and emits `withdrawal_requested` only once that worked. The API plans it (balance,
+ * route, quote); this worker never pays. It follows the swap to the end and records how it turned out.
+ * ------------------------------------------------------------------------------------------------- */
 
-  const depts = await db.select().from(departments).where(eq(departments.companyId, p.companyId));
-  const ids = depts.map((d) => d.id);
-  if (ids.length) await db.execute(sql`update rail_floats set paused = true where department_id = any(${ids})`);
-
-  try {
-    const intents = await intentsUsdcBalance(p.companyId);
-    let gap = toBig(p.amount) - intents;
-    const sources: Array<{ from: string; amount: string }> = [{ from: "intents", amount: (gap > 0n ? intents : toBig(p.amount)).toString() }];
-    if (gap > 0n) {
-      for (const d of depts) {
-        if (gap <= 0n) break;
-        const [f] = await db.select().from(railFloats).where(and(eq(railFloats.departmentId, d.id), eq(railFloats.rail, "tempo")));
-        const free = toBig(f?.balance) - toBig(f?.reserved); // never touch reserved (open sessions / pending purchases)
-        if (free <= 0n) continue;
-        const pull = free < gap ? free : gap;
-        sources.push({ from: `tempo:${d.id}`, amount: pull.toString() });
-        gap -= pull;
-      }
-      if (gap > 0n) throw new Error(`insufficient unreserved funds; short by ${gap}`);
-    }
-    // Swap/send via 1Click to the founder's chosen token/chain.
-    const quote = await bridgeClients.oneClickQuote({
-      amount: p.amount,
-      recipient: p.to,
-      refundTo: p.companyId,
-      originAsset: "nep141:usdc.near",
-      destinationAsset: p.token.includes(":") ? p.token : `nep141:${p.token}.near`,
-    });
-    const acc = await worker();
-    await callAs(
-      acc,
-      serviceCalls.recordWithdrawal(p.companyId, {
-        withdrawal_id: p.withdrawalId,
-        status: "done",
-        sources,
-        amount_out: quote.amountOut,
-        fees: quote.fees,
-        quote_id: quote.quoteId,
-        deposit_address: quote.depositAddress,
-      }),
-    );
-    await db.update(withdrawals).set({ status: "done", sources }).where(eq(withdrawals.id, p.withdrawalId));
-    log.info({ withdrawal: p.withdrawalId }, "withdrawal recorded");
-    return { status: "done", sources };
-  } catch (e: any) {
-    await db.update(withdrawals).set({ status: "failed" }).where(eq(withdrawals.id, p.withdrawalId));
-    throw e;
-  } finally {
-    // Recompute 50% targets on the new balance and resume top-ups.
-    if (ids.length) await db.execute(sql`update rail_floats set paused = false, updated_at = now() where department_id = any(${ids})`);
-  }
+/** The company's USDC in NEAR Intents (0 where Intents isn't deployed, i.e. on testnet). */
+export async function intentsUsdcBalance(companyId: string): Promise<bigint> {
+  const { view } = await import("@builderos/near");
+  const n = network().intents;
+  const bal = await view<string>(n.contract, "mt_balance_of", { account_id: companyId, token_id: n.usdcTokenId }).catch(() => "0");
+  return toBig(bal);
 }
 
-async function intentsUsdcBalance(companyId: string): Promise<bigint> {
-  const { view } = await import("@builderos/near");
-  const token = env().NETWORK === "testnet" ? "nep141:usdc.fakes.testnet" : "nep141:17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1";
-  const intents = env().NETWORK === "testnet" ? "intents.testnet" : "intents.near";
-  const bal = await view<string>(intents, "mt_balance_of", { account_id: companyId, token_id: token }).catch(() => "0");
-  return toBig(bal);
+export type WithdrawalRoute = {
+  /** "near": straight to a NEAR account. "swap": through a 1Click quote to another chain. */
+  route: "near" | "swap";
+  /** Intents id of the token that leaves the company. */
+  tokenId: string;
+  destinationAsset: string;
+  amountOut: string;
+  fees: string;
+  depositAddress: string | null;
+  quoteId: string | null;
+  /** The founder must sign before this (ISO time); null when there is no quote to expire. */
+  deadline: string | null;
+};
+
+/** How this withdrawal will travel, with a committed 1Click quote when it leaves NEAR. */
+export async function planWithdrawalRoute(p: { companyId: string; amount: string; to: string; chain: WithdrawalChain }): Promise<WithdrawalRoute> {
+  const tokenId = network().intents.usdcTokenId;
+  if (p.chain === "near") return { route: "near", tokenId, destinationAsset: tokenId, amountOut: p.amount, fees: "0", depositAddress: null, quoteId: null, deadline: null };
+  const destinationAsset = await bridgeClients.usdcAsset(p.chain);
+  // dry:false commits the quote and returns the one-time Intents account to fund
+  const q = await bridgeClients.oneClickQuote({ amount: p.amount, recipient: p.to, refundTo: p.companyId, originAsset: tokenId, destinationAsset, dry: false, deadlineMinutes: 20 });
+  if (!q.depositAddress) throw new Error("1Click returned a quote without a deposit address");
+  return { route: "swap", tokenId, destinationAsset, amountOut: q.amountOut, fees: q.fees, depositAddress: q.depositAddress, quoteId: q.quoteId, deadline: q.deadline ?? null };
+}
+
+type ChainCaller = (c: ReturnType<typeof serviceCalls.recordWithdrawal>) => Promise<unknown>;
+let chainCaller: ChainCaller | null = null;
+/** Test hook: how the worker's record-only call reaches the chain. Production signs with the worker key. */
+export const setChainCaller = (f: ChainCaller | null) => (chainCaller = f);
+const recordOnChain: ChainCaller = async (c) => (chainCaller ? chainCaller(c) : callAs(await worker(), c));
+
+export type WithdrawalJob = { withdrawalId: string; companyId: string; amount: string; token: string; to: string; chain?: string | null; route?: string | null; depositAddress?: string | null; quoteId?: string | null; nearTx?: string | null };
+
+/**
+ * Runs after `withdrawal_requested`, i.e. after the funds have left the company inside Intents. Follows a
+ * swap until 1Click reports a final state, then writes that outcome on chain (`record_withdrawal`) so the
+ * ledger shows what really happened: delivered, refunded to the company, or failed.
+ */
+export async function runWithdrawal(p: WithdrawalJob, log: Logger, opts: { pollMs?: number; tries?: number } = {}) {
+  const db = getDb();
+  const [w] = await db.select().from(withdrawals).where(eq(withdrawals.id, p.withdrawalId));
+  if (w && ["done", "refunded", "failed"].includes(w.status)) return { status: w.status };
+  const sources = [{ from: "intents", amount: p.amount }];
+  await db
+    .insert(withdrawals)
+    .values({ id: p.withdrawalId, companyId: p.companyId, amount: p.amount, token: p.token, to: p.to, chain: p.chain ?? null, status: "running", sources })
+    .onConflictDoUpdate({ target: withdrawals.id, set: { status: "running", sources } });
+
+  const record = async (status: "done" | "refunded" | "failed", out: { amountOut: string; fees: string; destTx: string | null }) => {
+    await recordOnChain(
+      serviceCalls.recordWithdrawal(p.companyId, { withdrawal_id: p.withdrawalId, status, sources, token: p.token, to: p.to, chain: p.chain ?? null, amount_in: p.amount, amount_out: out.amountOut, fees: out.fees, quote_id: p.quoteId ?? null, deposit_address: p.depositAddress ?? null, origin_tx: p.nearTx ?? null, dest_tx: out.destTx }),
+    );
+    await db.update(withdrawals).set({ status }).where(eq(withdrawals.id, p.withdrawalId));
+    log.info({ withdrawal: p.withdrawalId, status }, "withdrawal recorded");
+    return { status };
+  };
+
+  // Straight to a NEAR account: the contract's own transfer delivered it; there is no swap to follow.
+  if (p.route === "near") return record("done", { amountOut: p.amount, fees: "0", destTx: p.nearTx ?? null });
+
+  if (!p.depositAddress) throw new Error(`withdrawal ${p.withdrawalId} has no deposit address to follow`);
+  if (p.nearTx) await bridgeClients.oneClickSubmitDeposit({ depositAddress: p.depositAddress, txHash: p.nearTx });
+  const tries = opts.tries ?? 60;
+  for (let i = 0; i < tries; i++) {
+    const st = await bridgeClients.oneClickStatus(p.depositAddress);
+    if (st.state === "success") {
+      const out = st.amountOut ?? p.amount;
+      const fee = toBig(p.amount) - toBig(out);
+      return record("done", { amountOut: out, fees: (fee > 0n ? fee : 0n).toString(), destTx: st.destTx });
+    }
+    // refunded: 1Click returned the funds to the company's Intents balance. failed: it could not; shown as such.
+    if (st.state === "refunded" || st.state === "failed") return record(st.state, { amountOut: "0", fees: "0", destTx: null });
+    await new Promise((r) => setTimeout(r, opts.pollMs ?? 5_000));
+  }
+  throw new Error("withdrawal swap still processing; the job will retry");
 }

@@ -144,8 +144,22 @@ export const tx = {
     return deptCall(companyId, [{ department: name, method: "set_rail_float", args: { rail, target, enabled } }]);
   },
 
-  requestWithdrawal: (companyId: string, a: { withdrawalId: string; amount: string; token: string; to: string; chain: string }) =>
-    call(companyId, "request_withdrawal", { withdrawal_id: a.withdrawalId, amount: a.amount, token: a.token, to: a.to, chain: a.chain }, 50, ONE_YOCTO),
+  /**
+   * Founder withdrawal from the company's NEAR Intents balance. The contract moves the funds in this same
+   * transaction (route "near": ft_withdraw to `to`; route "swap": mt_transfer to the 1Click deposit address)
+   * and announces the withdrawal only after that transfer succeeded. Needs company contract_version ≥ 4.
+   */
+  requestWithdrawal: (
+    companyId: string,
+    a: { withdrawalId: string; amount: string; token: string; to: string; chain: string; route: "near" | "swap"; tokenId: string; depositAddress?: string | null; quoteId?: string | null },
+  ) =>
+    call(
+      companyId,
+      "request_withdrawal",
+      { withdrawal_id: a.withdrawalId, amount: a.amount, token: a.token, to: a.to, chain: a.chain, route: a.route, token_id: a.tokenId, deposit_address: a.depositAddress ?? null, quote_id: a.quoteId ?? null },
+      100,
+      ONE_YOCTO,
+    ),
 
   rotateCodeKey: (companyId: string, newVersion: number) => call(companyId, "rotate_code_key", { version: newVersion }, 30, ONE_YOCTO),
 
@@ -292,6 +306,8 @@ async function companyVersion(companyId: string): Promise<number> {
   versionCache.set(companyId, { v, at: Date.now() });
   return v;
 }
+/** Drop the cached contract_version (after an upgrade is applied, and in tests). */
+export const forgetCompanyVersion = (companyId?: string) => (companyId ? versionCache.delete(companyId) : versionCache.clear());
 /** How many calls one tx may carry for this company (1 on legacy code, see deptCalls). */
 export async function batchLimits(companyId: string) {
   const version = await companyVersion(companyId);
@@ -303,6 +319,8 @@ export async function batchLimits(companyId: string) {
     approvalsPerTx: ok ? APPROVALS_PER_TX : 1,
     /** allow_seller / set_evm_config / top_up_budget only work through dept_call from version 3. */
     zeroDepositForwarding: version >= 3,
+    /** request_withdrawal moves Intents funds itself from version 4; before that it only emitted an event. */
+    intentsWithdrawals: version >= 4,
   };
 }
 

@@ -57,6 +57,9 @@ const EnvSchema = z.object({
   TEMPO_USDC: z.string().optional(),
   ONECLICK_BASE_URL: z.string().default("https://1click.chaindefuser.com"),
   ONECLICK_JWT: z.string().optional(),
+  /** NEAR Intents verifier contract and the Intents id of USDC. Defaults follow NETWORK; override only for tests. */
+  INTENTS_CONTRACT: z.string().optional(),
+  INTENTS_USDC_TOKEN_ID: z.string().optional(),
   /** Relay API root, e.g. https://api.relay.link — omit to use seller-mesh mock when USE_SELLER_MESH. */
   RELAY_BASE_URL: z.string().optional(),
   /** Relay `x-api-key` (required for referrer traffic; required for all quote/v2 from Oct 2026). */
@@ -156,6 +159,14 @@ export function network() {
       relayOriginUsdc: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
     },
     oneClickDry: testnet,
+    /**
+     * NEAR Intents holds the company treasury. It is deployed on mainnet only: on testnet the account doesn't
+     * exist, balances read as 0, and withdrawals answer `insufficient_funds`.
+     */
+    intents: {
+      contract: e.INTENTS_CONTRACT ?? (testnet ? "intents.testnet" : "intents.near"),
+      usdcTokenId: e.INTENTS_USDC_TOKEN_ID ?? (testnet ? "nep141:usdc.fakes.testnet" : "nep141:17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1"),
+    },
   };
 }
 

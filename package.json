@@ -11,6 +11,7 @@
     "build": "turbo run build",
     "typecheck": "turbo run typecheck",
     "test": "vitest run",
+    "test:e2e": "tsx tests/e2e/flow.mts && tsx tests/e2e/intents.mts",
     "db:generate": "pnpm --filter @builderos/db generate",
     "db:migrate": "pnpm --filter @builderos/db migrate",
     "setup": "tsx scripts/setup.ts",

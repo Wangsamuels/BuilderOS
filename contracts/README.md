@@ -70,6 +70,13 @@ change goes through contract code:
   sees `upgrade_proposed`. After 24 h, `apply_upgrade` is called with the raw wasm as input, and only code
   matching the hash is deployed. `cancel_upgrade` withdraws a proposal.
 
+- **Withdrawals (company contract version 4):** `request_withdrawal` is founder-only (1 yocto) and moves the
+  company's NEAR Intents funds itself: `route "near"` calls `ft_withdraw` on the Intents contract to a NEAR
+  account, `route "swap"` calls `mt_transfer` to the one-time account of a 1Click quote. `withdrawal_requested`
+  is emitted from the callback only when that transfer succeeded; otherwise `withdrawal_failed` and the id is
+  free again. A withdrawal id can be used once. The worker key can only `record_withdrawal` (the outcome).
+  Companies created before version 4 need `propose_upgrade` → 24 h → `apply_upgrade` with the new `company.wasm`.
+
 ```bash
 # register an agent key from keystore/agents.public.json (founder's wallet signs)
 near contract call-function as-transaction acme.builderos-wang.testnet register_agent \

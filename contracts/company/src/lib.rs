@@ -22,6 +22,17 @@ const EVENT_STANDARD: &str = "builderos";
 const EVENT_VERSION: &str = "1.0.0";
 const TGAS: u64 = 1_000_000_000_000;
 
+/// NEAR Intents (the `defuse` verifier contract) holds the company treasury. It exists on mainnet only.
+fn intents_account() -> AccountId {
+    let id = if env::current_account_id().as_str().ends_with(".testnet") { "intents.testnet" } else { "intents.near" };
+    id.parse().unwrap()
+}
+
+/// Storage key marking a withdrawal id as used. Kept outside the contract struct, so no state migration is needed.
+fn withdrawal_key(id: &str) -> Vec<u8> {
+    [b"wd:".as_slice(), id.as_bytes()].concat()
+}
+
 fn emit(event: &str, data: Value) {
     let payload = json!({
         "standard": EVENT_STANDARD,
@@ -306,7 +317,7 @@ impl Contract {
     ///     team-limited approver can only approve/reject their own team's purchases.
     /// Older code has no such method.
     pub fn contract_version(&self) -> u32 {
-        3
+        4
     }
 
     pub fn get_company(&self) -> CompanyView {
@@ -631,6 +642,16 @@ impl Contract {
         );
     }
 
+    /// Founder withdraws USDC from the company's NEAR Intents balance. The founder's own signature moves
+    /// the money: this call transfers the funds inside Intents in the same transaction, and
+    /// `withdrawal_requested` is emitted only after that transfer succeeded.
+    ///
+    /// * `route = "near"`: the token leaves Intents straight to the NEAR account `to` (`ft_withdraw`).
+    /// * `route = "swap"`: the funds go to `deposit_address`, the one-time Intents account of a 1Click
+    ///   quote that delivers USDC to `to` on `chain` (`mt_transfer`). If that swap can't complete,
+    ///   1Click refunds this company's Intents balance.
+    ///
+    /// Each `withdrawal_id` works once. The worker has no part in moving funds; it only records the outcome.
     #[payable]
     pub fn request_withdrawal(
         &mut self,
@@ -639,20 +660,80 @@ impl Contract {
         token: String,
         to: String,
         chain: String,
-    ) {
+        route: String,
+        token_id: String,
+        deposit_address: Option<AccountId>,
+        quote_id: Option<String>,
+    ) -> Promise {
         self.assert_founder();
         require!(env::attached_deposit() >= NearToken::from_yoctonear(1), "1 yocto");
-        emit(
-            "withdrawal_requested",
-            json!({
+        require!(!withdrawal_id.is_empty() && withdrawal_id.len() <= 64, "bad withdrawal id");
+        let units: u128 = amount.parse().unwrap_or(0);
+        require!(units > 0, "amount must be a positive integer");
+        require!(token_id.starts_with("nep141:") && token_id.len() > 7, "token_id must be a nep141 Intents token");
+        let key = withdrawal_key(&withdrawal_id);
+        require!(!env::storage_has_key(&key), "this withdrawal was already requested");
+        env::storage_write(&key, b"1");
+
+        let intents = intents_account();
+        let memo = format!("builderos withdrawal {withdrawal_id}");
+        let (method, args, receiver) = match route.as_str() {
+            "near" => {
+                let receiver: AccountId = to.parse().unwrap_or_else(|_| env::panic_str("`to` is not a NEAR account"));
+                (
+                    "ft_withdraw",
+                    json!({ "token": &token_id["nep141:".len()..], "receiver_id": receiver, "amount": amount, "memo": memo }),
+                    receiver,
+                )
+            }
+            "swap" => {
+                let receiver = deposit_address.clone().unwrap_or_else(|| env::panic_str("deposit_address is required for a swap"));
+                require!(receiver != env::current_account_id(), "deposit_address can't be this company");
+                (
+                    "mt_transfer",
+                    json!({ "receiver_id": receiver, "token_id": token_id, "amount": amount, "memo": memo }),
+                    receiver,
+                )
+            }
+            _ => env::panic_str("route must be near or swap"),
+        };
+        let data = json!({
+            "company_id": env::current_account_id(),
+            "withdrawal_id": withdrawal_id,
+            "amount": amount,
+            "token": token,
+            "to": to,
+            "chain": chain,
+            "route": route,
+            "token_id": token_id,
+            "deposit_address": deposit_address,
+            "quote_id": quote_id,
+            "paid_to": receiver,
+        });
+        Promise::new(intents)
+            .function_call(method.to_string(), args.to_string().into_bytes(), NearToken::from_yoctonear(1), Gas::from_tgas(40))
+            .then(Self::ext(env::current_account_id()).with_static_gas(Gas::from_tgas(10)).on_withdrawal_paid(data))
+    }
+
+    /// Callback of `request_withdrawal`. Announces the withdrawal only if the Intents transfer went through;
+    /// otherwise nothing left the company and the id is released.
+    #[private]
+    pub fn on_withdrawal_paid(&mut self, data: Value) -> bool {
+        let failed = matches!(env::promise_result_checked(0, 256), Err(PromiseError::Failed));
+        if failed {
+            if let Some(id) = data.get("withdrawal_id").and_then(Value::as_str) {
+                env::storage_remove(&withdrawal_key(id));
+            }
+            emit("withdrawal_failed", json!({
                 "company_id": env::current_account_id(),
-                "withdrawal_id": withdrawal_id,
-                "amount": amount,
-                "token": token,
-                "to": to,
-                "chain": chain,
-            }),
-        );
+                "withdrawal_id": data.get("withdrawal_id"),
+                "amount": data.get("amount"),
+                "reason": "intents_transfer_failed",
+            }));
+            return false;
+        }
+        emit("withdrawal_requested", data);
+        true
     }
 
     pub fn record_withdrawal(&mut self, payload: Value) {
@@ -1101,5 +1182,142 @@ mod tests {
         testing_env!(bad, near_sdk::test_vm_config(), near_sdk::RuntimeFeesConfig::test(), Default::default(), vec![near_sdk::PromiseResult::Failed]);
         assert!(c.on_department_created("build".into(), acc("build.acme.builderos-wang.testnet"), acc("founder.testnet"), NearToken::from_millinear(4_500)).is_some(), "refund on failure");
         assert_eq!(c.get_departments().len(), 0);
+    }
+
+    // ---------- withdrawals from NEAR Intents ----------
+    const USDC: &str = "nep141:17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1";
+    const DEPOSIT: &str = "c6d7058a1ce152605ce97afcc3aeccb03bb3de9d43649bca815023f5931558c1";
+
+    fn swap(c: &mut Contract, id: &str, amount: &str) -> Promise {
+        c.request_withdrawal(id.into(), amount.into(), "usdc".into(), "0x7b1E4c0f2A9d53e8C6B4a1F09d2E7c5B8a3F6D10".into(), "base".into(), "swap".into(), USDC.into(), Some(acc(DEPOSIT)), Some("q-1".into()))
+    }
+    /// The first function call this transaction scheduled: (receiver, method, args, attached yocto).
+    fn first_call() -> (String, String, Value, u128) {
+        let receipts = near_sdk::test_utils::get_created_receipts();
+        let r = receipts.first().expect("a receipt");
+        for a in &r.actions {
+            if let near_sdk::mock::MockAction::FunctionCallWeight { method_name, args, attached_deposit, .. } = a {
+                return (r.receiver_id.to_string(), String::from_utf8(method_name.clone()).unwrap(), near_sdk::serde_json::from_slice(args).unwrap(), attached_deposit.as_yoctonear());
+            }
+        }
+        panic!("no function call");
+    }
+    fn callback(c: &mut Contract, result: near_sdk::PromiseResult, id: &str) -> bool {
+        let me = VMContextBuilder::new().current_account_id(acc("acme.builderos-wang.testnet")).predecessor_account_id(acc("acme.builderos-wang.testnet")).build();
+        testing_env!(me, near_sdk::test_vm_config(), near_sdk::RuntimeFeesConfig::test(), Default::default(), vec![result]);
+        c.on_withdrawal_paid(json!({ "company_id": "acme.builderos-wang.testnet", "withdrawal_id": id, "amount": "40000000", "deposit_address": DEPOSIT, "route": "swap" }))
+    }
+    fn events() -> String {
+        near_sdk::test_utils::get_logs().join("\n")
+    }
+
+    #[test]
+    fn withdrawal_swap_moves_intents_funds_to_the_quote_address() {
+        let mut c = company();
+        ctx("founder.testnet", 1, 2_000);
+        let _ = swap(&mut c, "w-1", "40000000");
+        let (receiver, method, args, deposit) = first_call();
+        assert_eq!(receiver, "intents.testnet");
+        assert_eq!(method, "mt_transfer");
+        assert_eq!(args["receiver_id"], DEPOSIT);
+        assert_eq!(args["token_id"], USDC);
+        assert_eq!(args["amount"], "40000000");
+        assert_eq!(deposit, 1);
+        // nothing is announced until the transfer is known to have worked
+        assert!(!events().contains("withdrawal_requested"));
+    }
+
+    #[test]
+    fn withdrawal_to_near_uses_ft_withdraw_to_the_founders_account() {
+        let mut c = company();
+        ctx("founder.testnet", 1, 2_000);
+        let _ = c.request_withdrawal("w-2".into(), "5000000".into(), "usdc".into(), "alice.near".into(), "near".into(), "near".into(), USDC.into(), None, None);
+        let (receiver, method, args, deposit) = first_call();
+        assert_eq!(receiver, "intents.testnet");
+        assert_eq!(method, "ft_withdraw");
+        assert_eq!(args["token"], "17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1");
+        assert_eq!(args["receiver_id"], "alice.near");
+        assert_eq!(args["amount"], "5000000");
+        assert_eq!(deposit, 1);
+    }
+
+    #[test]
+    fn withdrawal_is_announced_only_after_the_transfer_succeeds() {
+        let mut c = company();
+        ctx("founder.testnet", 1, 2_000);
+        let _ = swap(&mut c, "w-3", "40000000");
+        assert!(callback(&mut c, near_sdk::PromiseResult::Successful(vec![]), "w-3"));
+        let log = events();
+        assert!(log.contains("withdrawal_requested") && log.contains(DEPOSIT));
+        // the id is spent
+        ctx("founder.testnet", 1, 3_000);
+        let again = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = swap(&mut c, "w-3", "40000000");
+        }));
+        assert!(again.is_err(), "a withdrawal id works once");
+    }
+
+    #[test]
+    fn failed_transfer_announces_failure_and_releases_the_id() {
+        let mut c = company();
+        ctx("founder.testnet", 1, 2_000);
+        let _ = swap(&mut c, "w-4", "40000000");
+        assert!(!callback(&mut c, near_sdk::PromiseResult::Failed, "w-4"));
+        let log = events();
+        assert!(log.contains("withdrawal_failed") && !log.contains("withdrawal_requested"));
+        ctx("founder.testnet", 1, 3_000);
+        let _ = swap(&mut c, "w-4", "40000000"); // nothing left the company, so the same request may be tried again
+    }
+
+    #[test]
+    #[should_panic(expected = "founder only")]
+    fn only_the_founder_can_withdraw() {
+        let mut c = company();
+        ctx("mallory.testnet", 1, 2_000);
+        let _ = swap(&mut c, "w-5", "40000000");
+    }
+
+    #[test]
+    #[should_panic(expected = "founder only")]
+    fn the_worker_cannot_move_funds() {
+        let mut c = company();
+        ctx("worker.builderos-wang.testnet", 1, 2_000);
+        let _ = swap(&mut c, "w-6", "40000000");
+    }
+
+    #[test]
+    fn the_worker_records_the_outcome() {
+        let mut c = company();
+        ctx("worker.builderos-wang.testnet", 0, 2_000);
+        c.record_withdrawal(json!({ "withdrawal_id": "w-6", "status": "done" }));
+        assert!(events().contains("withdrawal_recorded"));
+    }
+
+    #[test]
+    #[should_panic(expected = "1 yocto")]
+    fn withdrawal_needs_the_founders_full_access_signature() {
+        let mut c = company();
+        ctx("founder.testnet", 0, 2_000);
+        let _ = swap(&mut c, "w-7", "40000000");
+    }
+
+    #[test]
+    fn withdrawal_rejects_bad_input() {
+        for (amount, route, token, deposit) in [("0", "swap", USDC, Some(DEPOSIT)), ("abc", "swap", USDC, Some(DEPOSIT)), ("10", "bridge", USDC, Some(DEPOSIT)), ("10", "swap", "usdc.near", Some(DEPOSIT)), ("10", "swap", USDC, None), ("10", "swap", USDC, Some("acme.builderos-wang.testnet"))] {
+            let r = std::panic::catch_unwind(|| {
+                let mut c = company();
+                ctx("founder.testnet", 1, 2_000);
+                let _ = c.request_withdrawal("w-8".into(), amount.into(), "usdc".into(), "0xabc".into(), "base".into(), route.into(), token.into(), deposit.map(acc), None);
+            });
+            assert!(r.is_err(), "should reject amount={amount} route={route} token={token} deposit={deposit:?}");
+        }
+    }
+
+    #[test]
+    fn mainnet_companies_use_intents_near() {
+        testing_env!(VMContextBuilder::new().current_account_id(acc("acme.builderos.near")).build());
+        assert_eq!(intents_account().as_str(), "intents.near");
+        testing_env!(VMContextBuilder::new().current_account_id(acc("acme.builderos-wang.testnet")).build());
+        assert_eq!(intents_account().as_str(), "intents.testnet");
     }
 }
