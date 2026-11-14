@@ -233,7 +233,7 @@ REST + JSON under `/v1`, validated with zod; writes accept an `Idempotency-Key`.
 | `packages/near/` | RPC client, NEP-413 verify, contract transaction builders and views |
 | `packages/fetch/` | `@builderos/fetch`, the spend-firewall SDK |
 | `packages/rails/` · `packages/router/` | Payment-rail adapters; model catalog, estimates and routing |
-| `packages/bridge/` | Withdrawal routing (NEAR Intents, 1Click) and optional Tempo top-ups |
+| `packages/bridge/` | Withdrawal routing (NEAR Intents, 1Click) and Tempo pocket top-ups (1Click + Relay) |
 | `packages/indexer/` · `packages/verifier/` | Block follower and event → receipt pipeline; foreign-tx verification |
 | `packages/crypto/` · `packages/keys/` | libsodium sealing, x25519 wrapping; wrapped-key store with grant checks |
 | `packages/orchestrator/` · `packages/notify/` | Planner, task DAG, agent keystore and runner; web push and email |
@@ -270,7 +270,9 @@ Deploy: Heroku (`Procfile`, `app.json`: web + worker + Postgres, migrations in t
 - NEAR Intents treasury (company deposit address, withdrawals with 1Click delivery). NEAR Intents is mainnet only; the path is covered by `tests/e2e/intents.mts` against simulated Intents and 1Click. The Intents call shapes and 1Click asset ids have not been exercised on mainnet.
 - Agent purchases end to end on live testnet: the contract path is covered by contract and simulator tests; a live run with funded agents is still pending.
 
-**Not running yet:** mainnet deployment; Tempo MPP payments (off, `TEMPO_ENABLED=false`); the `x402-near` rail; NEAR Lake indexing (RPC polling today).
+**Tempo (MPP):** enabled on the hosted backend (`TEMPO_ENABLED=true`). For services that only accept MPP, the bridge worker keeps each team's Tempo pocket topped up (USDC → Base → Tempo USDC.e through 1Click and Relay, at most twice a day, with a 1% fee guard), and a session wallet holds at most the session cap. Models still pay with x402 on Base USDC. The MPP one-off charge is not contract-signed yet: the contract refuses it and the router falls back to x402.
+
+**Not running yet:** mainnet deployment; the `x402-near` rail; NEAR Lake indexing (RPC polling today).
 
 **What BuilderOS can't stop:** a founder approving a bad purchase, or spending that stays inside the limits the founder set. The limits are the guarantee; choosing them is up to the founder.
 
